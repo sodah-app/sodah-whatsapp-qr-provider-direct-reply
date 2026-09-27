@@ -620,6 +620,18 @@ async function getPromotionsForCustomerIntro(
     "updated_at"
   ].join(",");
 
+  /*
+   * Only promotions that are active AND currently inside their
+   * validity window are eligible for customer introduction.
+   *
+   * We deliberately use one PostgREST `and` expression here instead
+   * of sending two separate `or` query parameters. That avoids an
+   * ambiguous/overwritten filter and guarantees expired promotions
+   * cannot reach the AI.
+   */
+  const validityFilter =
+    `(active.eq.true,or(valid_from.is.null,valid_from.lte.${now}),or(valid_until.is.null,valid_until.gte.${now}))`;
+
   const query = [
     `select=${encodeURIComponent(
       promotionColumns
@@ -628,12 +640,8 @@ async function getPromotionsForCustomerIntro(
       "business_id",
       businessId
     ),
-    "active=eq.true",
-    `or=${encodeURIComponent(
-      `valid_from.is.null,valid_from.lte.${now}`
-    )}`,
-    `or=${encodeURIComponent(
-      `valid_until.is.null,valid_until.gte.${now}`
+    `and=${encodeURIComponent(
+      validityFilter
     )}`,
     "order=created_at.asc",
     "limit=50"
