@@ -398,8 +398,8 @@ async function getBusinessConfiguration(
     if (!response.ok) {
       throw new Error(
         data?.message ||
-        data?.error_description ||
-        `Supabase request failed with status ${response.status}`
+          data?.error_description ||
+          `Supabase request failed with status ${response.status}`
       );
     }
 
@@ -428,7 +428,7 @@ async function getBusinessConfiguration(
     const aiPrompt =
       String(
         business[BUSINESS_PROMPT_COLUMN] ||
-        ""
+          ""
       ).trim();
 
     const result = {
@@ -994,19 +994,7 @@ async function createSession(
           );
 
           /*
-           * Send the message to the
-           * central message handler.
-           *
-           * The message-handler is now
-           * responsible for:
-           *
-           * - business lookup
-           * - customer lookup
-           * - catalog lookup
-           * - product matching
-           * - AI generation
-           * - product image sending
-           * - message persistence
+           * Direct AI reply.
            */
           await handleIncomingMessage({
             session,
@@ -1507,7 +1495,7 @@ app.get(
         const businessId =
           String(
             req.query.businessId ||
-            ""
+              ""
           ).trim();
 
         if (!businessId) {

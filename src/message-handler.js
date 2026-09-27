@@ -10,6 +10,8 @@ const {
   getBusinessById,
   getBusinessCatalog,
   getProductImageUrl,
+  getPromotionsForCustomerIntro,
+  markPromotionIntroduced,
   saveMessage,
   upsertCustomer
 } = require("./supabase");
@@ -30,9 +32,6 @@ function rememberMessage(id) {
 
   processed.set(id, Date.now());
 
-  /*
-   * Keep the map small.
-   */
   if (processed.size > 5000) {
     const now = Date.now();
 
@@ -51,14 +50,31 @@ function rememberMessage(id) {
 function phoneFromJid(jid) {
   const value = String(jid || "").trim();
 
-  if (!value) {
-    return "";
-  }
+  if (!value) return "";
 
   return value
     .split("@")[0]
     .split(":")[0]
     .replace(/\D/g, "");
+}
+
+/* =========================================================
+   CUSTOMER NAME
+========================================================= */
+
+function extractCustomerName(message) {
+  const candidates = [
+    message?.pushName,
+    message?.verifiedBizName,
+    message?.key?.pushName
+  ];
+
+  for (const value of candidates) {
+    const name = String(value || "").trim();
+    if (name) return name.slice(0, 120);
+  }
+
+  return "";
 }
 
 /* =========================================================
@@ -86,28 +102,10 @@ function extractText(message) {
 ========================================================= */
 
 function shouldIgnore(remoteJid, fromMe) {
-  if (fromMe) {
-    return true;
-  }
-
-  if (!remoteJid) {
-    return true;
-  }
-
-  /*
-   * WhatsApp status.
-   */
-  if (remoteJid === "status@broadcast") {
-    return true;
-  }
-
-  /*
-   * WhatsApp groups.
-   */
-  if (remoteJid.endsWith("@g.us")) {
-    return true;
-  }
-
+  if (fromMe) return true;
+  if (!remoteJid) return true;
+  if (remoteJid === "status@broadcast") return true;
+  if (remoteJid.endsWith("@g.us")) return true;
   return false;
 }
 
@@ -120,7 +118,7 @@ function normalizeText(value) {
     .toLowerCase()
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -136,24 +134,6 @@ function tokenize(value) {
    PRODUCT MATCHING
 ========================================================= */
 
-/**
- * Find products that are actually relevant to the customer's
- * message.
- *
- * We intentionally do NOT send the entire catalog to the AI
- * for every message.
- *
- * Example:
- *
- * Customer:
- *   "How much is the Jordan 4?"
- *
- * Product:
- *   "Jordan 4"
- *
- * Result:
- *   Strong match.
- */
 function findRelevantProducts(products, messageText) {
   if (!Array.isArray(products) || products.length === 0) {
     return [];
@@ -162,39 +142,22 @@ function findRelevantProducts(products, messageText) {
   const message = normalizeText(messageText);
   const messageTokens = new Set(tokenize(messageText));
 
-  if (!message) {
-    return [];
-  }
+  if (!message) return [];
 
   const scored = [];
 
   for (const product of products) {
-    if (!product?.active) {
-      continue;
-    }
+    if (!product?.active) continue;
 
-    const productName =
-      normalizeText(product.product_name);
+    const productName = normalizeText(product.product_name);
+    const sku = normalizeText(product.sku);
+    const category = normalizeText(product.category);
+    const description = normalizeText(product.description);
 
-    const sku =
-      normalizeText(product.sku);
-
-    const category =
-      normalizeText(product.category);
-
-    const description =
-      normalizeText(product.description);
-
-    if (!productName) {
-      continue;
-    }
+    if (!productName) continue;
 
     let score = 0;
 
-    /*
-     * Strongest signal:
-     * exact product name appears in the message.
-     */
     if (
       message.includes(productName) &&
       productName.length >= 2
@@ -202,22 +165,11 @@ function findRelevantProducts(products, messageText) {
       score += 100;
     }
 
-    /*
-     * Exact SKU match.
-     */
-    if (
-      sku &&
-      message.includes(sku)
-    ) {
+    if (sku && message.includes(sku)) {
       score += 100;
     }
 
-    const productNameTokens =
-      tokenize(product.product_name);
-
-    /*
-     * Product-name token overlap.
-     */
+    const productNameTokens = tokenize(product.product_name);
     let nameTokenMatches = 0;
 
     for (const token of productNameTokens) {
@@ -227,14 +179,9 @@ function findRelevantProducts(products, messageText) {
     }
 
     if (nameTokenMatches > 0) {
-      score +=
-        nameTokenMatches * 20;
+      score += nameTokenMatches * 20;
     }
 
-    /*
-     * If all meaningful product-name tokens are present,
-     * make this a strong match.
-     */
     if (
       productNameTokens.length > 0 &&
       nameTokenMatches === productNameTokens.length
@@ -242,22 +189,11 @@ function findRelevantProducts(products, messageText) {
       score += 60;
     }
 
-    /*
-     * Category match.
-     */
-    if (
-      category &&
-      message.includes(category)
-    ) {
+    if (category && message.includes(category)) {
       score += 15;
     }
 
-    /*
-     * Description token overlap.
-     */
-    const descriptionTokens =
-      tokenize(product.description);
-
+    const descriptionTokens = tokenize(product.description);
     let descriptionMatches = 0;
 
     for (const token of descriptionTokens) {
@@ -266,17 +202,9 @@ function findRelevantProducts(products, messageText) {
       }
     }
 
-    score += Math.min(
-      descriptionMatches * 2,
-      10
-    );
+    score += Math.min(descriptionMatches * 2, 10);
 
-    /*
-     * Ignore weak matches.
-     */
-    if (score < 20) {
-      continue;
-    }
+    if (score < 20) continue;
 
     scored.push({
       product,
@@ -284,13 +212,8 @@ function findRelevantProducts(products, messageText) {
     });
   }
 
-  scored.sort(
-    (a, b) => b.score - a.score
-  );
+  scored.sort((a, b) => b.score - a.score);
 
-  /*
-   * Return only the strongest few matches.
-   */
   return scored
     .slice(0, 5)
     .map((item) => item.product);
@@ -315,20 +238,10 @@ function buildProductContext(products) {
         ? null
         : product.price,
     currency: product.currency || "AED",
-    availability:
-      product.availability || null,
-    promotion:
-      product.promotion || null,
-    category:
-      product.category || null,
-    sku:
-      product.sku || null,
-
-    /*
-     * Do not expose private storage paths to OpenAI.
-     *
-     * Only tell the AI whether a real image exists.
-     */
+    availability: product.availability || null,
+    promotion: product.promotion || null,
+    category: product.category || null,
+    sku: product.sku || null,
     has_image:
       Array.isArray(product.images) &&
       product.images.length > 0
@@ -356,15 +269,10 @@ async function getPrimaryProductImage(product) {
           Number(b.sort_order || 0)
       )[0];
 
-  if (!image) {
-    return null;
-  }
+  if (!image) return null;
 
   try {
-    return await getProductImageUrl(
-      image,
-      3600
-    );
+    return await getProductImageUrl(image, 3600);
   } catch (error) {
     logger.warn(
       {
@@ -379,77 +287,176 @@ async function getPrimaryProductImage(product) {
 }
 
 /* =========================================================
-   SEND TEXT / IMAGE
+   PROMOTION IMAGE
 ========================================================= */
 
-async function sendReply(
-  session,
-  remoteJid,
-  reply,
-  productImageUrl = null,
-  product = null
-) {
-  if (!session?.socket) {
-    throw new Error(
-      "WhatsApp socket is not available."
-    );
-  }
-
-  const text = String(reply || "").trim();
-
-  if (!text) {
+async function getPrimaryPromotionImage(promotion) {
+  if (
+    !promotion ||
+    !Array.isArray(promotion.images) ||
+    promotion.images.length === 0
+  ) {
     return null;
   }
 
-  /*
-   * Only send an image when:
-   *
-   * 1. We have a real uploaded image.
-   * 2. We have a clear product match.
-   *
-   * Never generate or invent an image.
-   */
-  if (
-    productImageUrl &&
-    product
-  ) {
-    try {
-      const result =
-        await session.socket.sendMessage(
-          remoteJid,
-          {
-            image: {
-              url: productImageUrl
-            },
-            caption: text
-          }
-        );
+  const image =
+    [...promotion.images]
+      .sort(
+        (a, b) =>
+          Number(a.sort_order || 0) -
+          Number(b.sort_order || 0)
+      )[0];
 
-      logger.info(
+  if (!image) return null;
+
+  try {
+    if (image.storage_path) {
+      return await getProductImageUrl(
         {
-          businessId:
-            session.businessId,
-          productId:
-            product.id,
-          productName:
-            product.product_name
+          storage_path: image.storage_path,
+          image_url: image.image_url
         },
-        "WhatsApp product image reply sent."
+        3600,
+        process.env.SUPABASE_PROMOTION_IMAGE_BUCKET ||
+          "business-promotion-images"
       );
+    }
 
-      return result;
+    return image.image_url || null;
+  } catch (error) {
+    logger.warn(
+      {
+        promotionId: promotion.id,
+        error: error.message
+      },
+      "Promotion image URL could not be generated."
+    );
+
+    return null;
+  }
+}
+
+/* =========================================================
+   SEND TEXT / IMAGE
+========================================================= */
+
+async function sendText(socket, remoteJid, text) {
+  const value = String(text || "").trim();
+  if (!value) return null;
+
+  return socket.sendMessage(
+    remoteJid,
+    {
+      text: value
+    }
+  );
+}
+
+async function sendImage(socket, remoteJid, imageUrl, caption) {
+  if (!imageUrl) return null;
+
+  return socket.sendMessage(
+    remoteJid,
+    {
+      image: {
+        url: imageUrl
+      },
+      caption: String(caption || "").trim()
+    }
+  );
+}
+
+/*
+ * Promotion-first ordering:
+ *
+ * 1. AI reply containing the new promotion introduction.
+ * 2. Real promotion/package flyer(s).
+ * 3. Product answer image, when there is a clear product match.
+ *
+ * If there is no promotion introduction, the previous product-image
+ * behavior remains unchanged.
+ */
+async function sendReply({
+  socket,
+  remoteJid,
+  reply,
+  promotionAssets,
+  productImageUrl,
+  matchedProduct
+}) {
+  const promotions =
+    Array.isArray(promotionAssets)
+      ? promotionAssets
+      : [];
+
+  if (promotions.length > 0) {
+    await sendText(
+      socket,
+      remoteJid,
+      reply
+    );
+
+    for (const promotion of promotions) {
+      if (!promotion?.imageUrl) continue;
+
+      const captionParts = [];
+
+      if (promotion.title) {
+        captionParts.push(
+          String(promotion.title).trim()
+        );
+      }
+
+      if (
+        promotion.price !== null &&
+        promotion.price !== undefined &&
+        promotion.price !== ""
+      ) {
+        captionParts.push(
+          `${promotion.currency || "AED"} ${promotion.price}`
+        );
+      }
+
+      await sendImage(
+        socket,
+        remoteJid,
+        promotion.imageUrl,
+        captionParts.join(" • ")
+      );
+    }
+
+    /*
+     * If the customer also asked about a specific product,
+     * its real product image comes after the promotion.
+     */
+    if (productImageUrl && matchedProduct) {
+      await sendImage(
+        socket,
+        remoteJid,
+        productImageUrl,
+        reply
+      );
+    }
+
+    return;
+  }
+
+  /*
+   * No promotion introduction: preserve the normal product
+   * image behavior.
+   */
+  if (productImageUrl && matchedProduct) {
+    try {
+      return await sendImage(
+        socket,
+        remoteJid,
+        productImageUrl,
+        reply
+      );
     } catch (error) {
-      /*
-       * Important:
-       * If the image fails, the customer must still
-       * receive the text answer.
-       */
       logger.warn(
         {
-          businessId:
-            session.businessId,
-          productId:
-            product.id,
+          productId: matchedProduct.id,
           error: error.message
         },
         "Product image send failed. Falling back to text."
@@ -457,11 +464,10 @@ async function sendReply(
     }
   }
 
-  return await session.socket.sendMessage(
+  return sendText(
+    socket,
     remoteJid,
-    {
-      text
-    }
+    reply
   );
 }
 
@@ -483,16 +489,10 @@ async function handleIncomingMessage({
   const messageId =
     message?.key?.id || "";
 
-  /*
-   * Ignore invalid messages.
-   */
   if (!remoteJid || !messageId) {
     return;
   }
 
-  /*
-   * Ignore our own messages, groups and status.
-   */
   if (
     shouldIgnore(
       remoteJid,
@@ -502,29 +502,17 @@ async function handleIncomingMessage({
     return;
   }
 
-  /*
-   * Deduplicate.
-   */
   if (processed.has(messageId)) {
     return;
   }
 
   rememberMessage(messageId);
 
-  /*
-   * Extract customer text.
-   */
   const text =
     extractText(message);
 
-  if (!text) {
-    return;
-  }
+  if (!text) return;
 
-  /*
-   * Use the socket supplied by the caller.
-   * Fall back to session.socket.
-   */
   const whatsappSocket =
     socket || session?.socket;
 
@@ -536,12 +524,18 @@ async function handleIncomingMessage({
       },
       "WhatsApp socket is unavailable."
     );
-
     return;
   }
 
   const customerPhone =
     phoneFromJid(remoteJid);
+
+  const customerName =
+    extractCustomerName(message);
+
+  const customerKey =
+    customerPhone ||
+    remoteJid;
 
   logger.info(
     {
@@ -550,6 +544,7 @@ async function handleIncomingMessage({
       businessId:
         session?.businessId,
       customerPhone,
+      customerName,
       messageId,
       text
     },
@@ -564,19 +559,14 @@ async function handleIncomingMessage({
     await saveMessage({
       business_id:
         session.businessId,
-
       channel:
         "whatsapp",
-
       direction:
         "inbound",
-
       customer_phone:
         customerPhone,
-
       message:
         text,
-
       message_id:
         messageId
     });
@@ -585,7 +575,8 @@ async function handleIncomingMessage({
       {
         businessId:
           session.businessId,
-        error: error.message
+        error:
+          error.message
       },
       "Incoming message persistence failed."
     );
@@ -599,19 +590,14 @@ async function handleIncomingMessage({
     await upsertCustomer({
       business_id:
         session.businessId,
-
       channel:
         "whatsapp",
-
       channel_customer_id:
-        customerPhone || remoteJid,
-
+        customerKey,
       phone:
         customerPhone || null,
-
       last_message:
         text,
-
       updated_at:
         new Date().toISOString()
     });
@@ -621,7 +607,8 @@ async function handleIncomingMessage({
         businessId:
           session.businessId,
         customerPhone,
-        error: error.message
+        error:
+          error.message
       },
       "Customer persistence failed."
     );
@@ -643,11 +630,11 @@ async function handleIncomingMessage({
       {
         businessId:
           session.businessId,
-        error: error.message
+        error:
+          error.message
       },
       "Business lookup failed."
     );
-
     return;
   }
 
@@ -659,12 +646,11 @@ async function handleIncomingMessage({
       },
       "Business was not found."
     );
-
     return;
   }
 
   /* =======================================================
-     LOAD BUSINESS CATALOG
+     LOAD PRODUCT CATALOG
   ======================================================= */
 
   let catalog = [];
@@ -685,24 +671,18 @@ async function handleIncomingMessage({
       "Business product catalog loaded."
     );
   } catch (error) {
-    /*
-     * Catalog failure must NOT stop normal AI.
-     */
     logger.warn(
       {
         businessId:
           session.businessId,
-        error: error.message
+        error:
+          error.message
       },
       "Product catalog lookup failed. Continuing without catalog."
     );
 
     catalog = [];
   }
-
-  /* =======================================================
-     FIND RELEVANT PRODUCTS
-  ======================================================= */
 
   const relevantProducts =
     findRelevantProducts(
@@ -715,23 +695,82 @@ async function handleIncomingMessage({
       relevantProducts
     );
 
-  logger.info(
-    {
-      businessId:
+  /* =======================================================
+     LOAD NEW ACTIVE PROMOTIONS
+  ======================================================= */
+
+  let pendingPromotions = [];
+
+  try {
+    /*
+     * This returns only active promotions that this customer
+     * has not already received, or promotions whose content
+     * was updated after the customer last received them.
+     *
+     * Therefore:
+     *
+     * - new customer + active promotion => introduce it
+     * - old customer + brand-new promotion => introduce it
+     * - old customer + unchanged old promotion => don't repeat
+     * - updated promotion => introduce updated version once
+     */
+    pendingPromotions =
+      await getPromotionsForCustomerIntro(
         session.businessId,
-      customerPhone,
-      messageText:
-        text,
-      matchedProducts:
-        relevantProducts.map(
-          (product) => ({
-            id: product.id,
-            name: product.product_name
-          })
-        )
-    },
-    "Relevant product lookup completed."
-  );
+        customerKey
+      );
+
+    logger.info(
+      {
+        businessId:
+          session.businessId,
+        customerKey,
+        promotionCount:
+          pendingPromotions.length
+      },
+      "Promotion introduction lookup completed."
+    );
+  } catch (error) {
+    logger.warn(
+      {
+        businessId:
+          session.businessId,
+        customerKey,
+        error:
+          error.message
+      },
+      "Promotion lookup failed. Continuing without promotions."
+    );
+
+    pendingPromotions = [];
+  }
+
+  const promotionContext =
+    pendingPromotions.map(
+      (promotion) => ({
+        id:
+          promotion.id,
+        title:
+          promotion.title || null,
+        description:
+          promotion.description || null,
+        price:
+          promotion.price ?? null,
+        currency:
+          promotion.currency || "AED",
+        promotion_type:
+          promotion.promotion_type || null,
+        valid_from:
+          promotion.valid_from || null,
+        valid_until:
+          promotion.valid_until || null,
+        has_image:
+          Array.isArray(
+            promotion.images
+          ) &&
+          promotion.images.length > 0
+      })
+    );
 
   /* =======================================================
      GENERATE AI REPLY
@@ -744,14 +783,15 @@ async function handleIncomingMessage({
       await generateReply({
         business,
         customerPhone,
+        customerName,
         messageText:
           text,
-
-        /*
-         * ai.js will use this on the next step.
-         */
         products:
-          productContext
+          productContext,
+        promotions:
+          promotionContext,
+        introducePromotions:
+          pendingPromotions.length > 0
       });
   } catch (error) {
     logger.error(
@@ -759,7 +799,8 @@ async function handleIncomingMessage({
         businessId:
           session.businessId,
         customerPhone,
-        error: error.message
+        error:
+          error.message
       },
       "AI reply generation failed."
     );
@@ -776,7 +817,8 @@ async function handleIncomingMessage({
         businessId:
           session.businessId,
         error:
-          result?.error || "Unknown AI error"
+          result?.error ||
+          "Unknown AI error"
       },
       "AI did not return a usable reply."
     );
@@ -802,18 +844,48 @@ async function handleIncomingMessage({
   }
 
   /* =======================================================
+     RESOLVE REAL PROMOTION IMAGES
+  ======================================================= */
+
+  const promotionAssets = [];
+
+  if (pendingPromotions.length > 0) {
+    for (
+      const promotion
+      of pendingPromotions
+    ) {
+      const imageUrl =
+        await getPrimaryPromotionImage(
+          promotion
+        );
+
+      if (imageUrl) {
+        promotionAssets.push({
+          id:
+            promotion.id,
+          title:
+            promotion.title,
+          price:
+            promotion.price,
+          currency:
+            promotion.currency ||
+            "AED",
+          imageUrl
+        });
+      }
+    }
+  }
+
+  /* =======================================================
      PRODUCT IMAGE
   ======================================================= */
 
-  let productImageUrl = null;
-  let matchedProduct = null;
+  let productImageUrl =
+    null;
 
-  /*
-   * Only attach an image when there is one clear match.
-   *
-   * If several products match, we don't risk sending the
-   * wrong product image.
-   */
+  let matchedProduct =
+    null;
+
   if (
     relevantProducts.length === 1
   ) {
@@ -834,17 +906,15 @@ async function handleIncomingMessage({
 
   try {
     sent =
-      await sendReply(
-        {
-          ...session,
-          socket:
-            whatsappSocket
-        },
+      await sendReply({
+        socket:
+          whatsappSocket,
         remoteJid,
         reply,
+        promotionAssets,
         productImageUrl,
         matchedProduct
-      );
+      });
   } catch (error) {
     logger.error(
       {
@@ -861,6 +931,44 @@ async function handleIncomingMessage({
   }
 
   /* =======================================================
+     MARK PROMOTIONS AS INTRODUCED
+  ======================================================= */
+
+  if (
+    pendingPromotions.length > 0
+  ) {
+    for (
+      const promotion
+      of pendingPromotions
+    ) {
+      try {
+        await markPromotionIntroduced({
+          businessId:
+            session.businessId,
+          promotionId:
+            promotion.id,
+          customerKey,
+          promotionUpdatedAt:
+            promotion.updated_at
+        });
+      } catch (error) {
+        logger.warn(
+          {
+            businessId:
+              session.businessId,
+            promotionId:
+              promotion.id,
+            customerKey,
+            error:
+              error.message
+          },
+          "Promotion introduction state could not be saved."
+        );
+      }
+    }
+  }
+
+  /* =======================================================
      SAVE OUTGOING MESSAGE
   ======================================================= */
 
@@ -868,37 +976,39 @@ async function handleIncomingMessage({
     await saveMessage({
       business_id:
         session.businessId,
-
       channel:
         "whatsapp",
-
       direction:
         "outbound",
-
       customer_phone:
         customerPhone,
-
       message:
         reply,
-
       message_id:
         sent?.key?.id || null,
-
-      metadata:
-        matchedProduct
-          ? {
-              product_id:
-                matchedProduct.id,
-
-              product_name:
-                matchedProduct.product_name,
-
-              product_image_sent:
-                Boolean(
-                  productImageUrl
-                )
-            }
-          : null
+      metadata: {
+        customer_name:
+          customerName || null,
+        promotions_introduced:
+          pendingPromotions.map(
+            (promotion) => ({
+              id:
+                promotion.id,
+              title:
+                promotion.title
+            })
+          ),
+        promotion_images_sent:
+          promotionAssets.length,
+        product_id:
+          matchedProduct?.id ||
+          null,
+        product_name:
+          matchedProduct?.product_name ||
+          null,
+        product_image_sent:
+          Boolean(productImageUrl)
+      }
     });
   } catch (error) {
     logger.warn(
@@ -916,18 +1026,19 @@ async function handleIncomingMessage({
     {
       sessionId:
         session?.sessionId,
-
       businessId:
         session.businessId,
-
       customerPhone,
-
+      customerName,
       messageId:
         sent?.key?.id || null,
-
+      promotionsIntroduced:
+        pendingPromotions.length,
+      promotionImagesSent:
+        promotionAssets.length,
       productId:
-        matchedProduct?.id || null,
-
+        matchedProduct?.id ||
+        null,
       productImageSent:
         Boolean(productImageUrl)
     },
@@ -937,6 +1048,15 @@ async function handleIncomingMessage({
   return {
     ok: true,
     reply,
+    promotions:
+      pendingPromotions.map(
+        (promotion) => ({
+          id:
+            promotion.id,
+          title:
+            promotion.title
+        })
+      ),
     product:
       matchedProduct
         ? {
@@ -960,5 +1080,6 @@ async function handleIncomingMessage({
 module.exports = {
   handleIncomingMessage,
   extractText,
-  phoneFromJid
+  phoneFromJid,
+  extractCustomerName
 };
