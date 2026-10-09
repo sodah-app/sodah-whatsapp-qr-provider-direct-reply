@@ -1,3 +1,4 @@
+
 const pino = require("pino");
 
 const logger = pino({
@@ -13,7 +14,8 @@ const {
   getPromotionsForCustomerIntro,
   markPromotionIntroduced,
   saveMessage,
-  upsertCustomer
+  upsertCustomer,
+  reserveSubscriptionExpiryReminder
 } = require("./supabase");
 
 /* =========================================================
@@ -23,9 +25,8 @@ const {
 const processed = new Map();
 
 const ttlMs =
-  Number(
-    process.env.MESSAGE_DEDUP_TTL_SECONDS || 120
-  ) * 1000;
+  Number(process.env.MESSAGE_DEDUP_TTL_SECONDS || 120) *
+  1000;
 
 function rememberMessage(id) {
   if (!id) return;
@@ -58,6 +59,14 @@ function phoneFromJid(jid) {
     .replace(/\D/g, "");
 }
 
+function toWhatsAppJid(phone) {
+  const normalized = phoneFromJid(phone);
+
+  return normalized
+    ? `${normalized}@s.whatsapp.net`
+    : "";
+}
+
 /* =========================================================
    CUSTOMER NAME
 ========================================================= */
@@ -71,6 +80,7 @@ function extractCustomerName(message) {
 
   for (const value of candidates) {
     const name = String(value || "").trim();
+
     if (name) return name.slice(0, 120);
   }
 
@@ -106,7 +116,213 @@ function shouldIgnore(remoteJid, fromMe) {
   if (!remoteJid) return true;
   if (remoteJid === "status@broadcast") return true;
   if (remoteJid.endsWith("@g.us")) return true;
+
   return false;
+}
+
+/* =========================================================
+   SUBSCRIPTION VALIDATION
+========================================================= */
+
+function getSubscriptionState(business) {
+  const status = String(
+    business?.subscription_status || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const expiryValue = business?.subscription_expiry;
+
+  const expiryTime = expiryValue
+    ? new Date(expiryValue).getTime()
+    : NaN;
+
+  const validExpiry = Number.isFinite(expiryTime);
+
+  const active =
+    status === "active" &&
+    validExpiry &&
+    expiryTime > Date.now();
+
+  return {
+    active,
+    status,
+    expiryTime: validExpiry ? expiryTime : null,
+    expiry: expiryValue || null
+  };
+}
+
+/* =========================================================
+   SUBSCRIPTION EXPIRY REMINDER
+========================================================= */
+
+async function handleExpiredSubscription({
+  business,
+  businessId,
+  socket
+}) {
+  const state = getSubscriptionState(business);
+
+  logger.warn(
+    {
+      businessId,
+      subscriptionStatus: state.status,
+      subscriptionExpiry: state.expiry
+    },
+    "AI automation blocked because the subscription is inactive or expired."
+  );
+
+  /*
+   * Prefer the support number as the owner notification
+   * destination. It must be a separate, reachable phone
+   * number rather than the connected sending account.
+   */
+  const recipientPhone = phoneFromJid(
+    business?.support_number || ""
+  );
+
+  const connectedPhone = phoneFromJid(
+    business?.ai_number || ""
+  );
+
+  if (!recipientPhone) {
+    logger.warn(
+      { businessId },
+      "Subscription reminder skipped: support_number is missing."
+    );
+
+    return {
+      ok: false,
+      reason: "subscription_expired",
+      reminder: "no_recipient"
+    };
+  }
+
+  if (
+    connectedPhone &&
+    recipientPhone === connectedPhone
+  ) {
+    logger.warn(
+      { businessId },
+      "Subscription reminder skipped: support_number matches ai_number."
+    );
+
+    return {
+      ok: false,
+      reason: "subscription_expired",
+      reminder: "recipient_is_connected_number"
+    };
+  }
+
+  if (
+    typeof reserveSubscriptionExpiryReminder !== "function"
+  ) {
+    logger.error(
+      { businessId },
+      "Reminder reservation function is unavailable."
+    );
+
+    return {
+      ok: false,
+      reason: "subscription_expired",
+      reminder: "reservation_unavailable"
+    };
+  }
+
+  /*
+   * The database function atomically reserves one of the
+   * two reminder slots in the preceding 24 hours.
+   */
+  let reserved;
+
+  try {
+    reserved = await reserveSubscriptionExpiryReminder({
+      businessId,
+      recipientPhone
+    });
+  } catch (error) {
+    logger.error(
+      {
+        businessId,
+        error: error.message
+      },
+      "Could not reserve subscription expiry reminder."
+    );
+
+    return {
+      ok: false,
+      reason: "subscription_expired",
+      reminder: "reservation_failed"
+    };
+  }
+
+  if (!reserved) {
+    logger.info(
+      { businessId },
+      "Subscription reminder suppressed: daily limit reached."
+    );
+
+    return {
+      ok: false,
+      reason: "subscription_expired",
+      reminder: "daily_limit_reached"
+    };
+  }
+
+  const reminderText =
+    "Hi 👋 Your WhatsApp messages are currently going unreplied because your Sodah.io subscription has expired. Subscribe now to restore your AI automation and continue responding to your customers.";
+
+  const recipientJid = toWhatsAppJid(recipientPhone);
+
+  if (!recipientJid) {
+    logger.warn(
+      { businessId },
+      "Subscription reminder skipped: invalid recipient phone."
+    );
+
+    return {
+      ok: false,
+      reason: "subscription_expired",
+      reminder: "invalid_recipient"
+    };
+  }
+
+  try {
+    await sendText(
+      socket,
+      recipientJid,
+      reminderText
+    );
+
+    logger.info(
+      {
+        businessId,
+        recipientPhone
+      },
+      "Subscription expiry reminder sent."
+    );
+
+    return {
+      ok: false,
+      reason: "subscription_expired",
+      reminder: "sent"
+    };
+  } catch (error) {
+    logger.error(
+      {
+        businessId,
+        recipientPhone,
+        error: error.message
+      },
+      "Subscription expiry reminder could not be sent."
+    );
+
+    return {
+      ok: false,
+      reason: "subscription_expired",
+      reminder: "send_failed"
+    };
+  }
 }
 
 /* =========================================================
@@ -152,16 +368,12 @@ function findRelevantProducts(products, messageText) {
     const productName = normalizeText(product.product_name);
     const sku = normalizeText(product.sku);
     const category = normalizeText(product.category);
-    const description = normalizeText(product.description);
 
     if (!productName) continue;
 
     let score = 0;
 
-    if (
-      message.includes(productName) &&
-      productName.length >= 2
-    ) {
+    if (message.includes(productName) && productName.length >= 2) {
       score += 100;
     }
 
@@ -206,10 +418,7 @@ function findRelevantProducts(products, messageText) {
 
     if (score < 20) continue;
 
-    scored.push({
-      product,
-      score
-    });
+    scored.push({ product, score });
   }
 
   scored.sort((a, b) => b.score - a.score);
@@ -233,8 +442,7 @@ function buildProductContext(products) {
     product_name: product.product_name || null,
     description: product.description || null,
     price:
-      product.price === null ||
-      product.price === undefined
+      product.price === null || product.price === undefined
         ? null
         : product.price,
     currency: product.currency || "AED",
@@ -261,13 +469,11 @@ async function getPrimaryProductImage(product) {
     return null;
   }
 
-  const image =
-    [...product.images]
-      .sort(
-        (a, b) =>
-          Number(a.sort_order || 0) -
-          Number(b.sort_order || 0)
-      )[0];
+  const image = [...product.images].sort(
+    (a, b) =>
+      Number(a.sort_order || 0) -
+      Number(b.sort_order || 0)
+  )[0];
 
   if (!image) return null;
 
@@ -299,13 +505,11 @@ async function getPrimaryPromotionImage(promotion) {
     return null;
   }
 
-  const image =
-    [...promotion.images]
-      .sort(
-        (a, b) =>
-          Number(a.sort_order || 0) -
-          Number(b.sort_order || 0)
-      )[0];
+  const image = [...promotion.images].sort(
+    (a, b) =>
+      Number(a.sort_order || 0) -
+      Number(b.sort_order || 0)
+  )[0];
 
   if (!image) return null;
 
@@ -342,28 +546,21 @@ async function getPrimaryPromotionImage(promotion) {
 
 async function sendText(socket, remoteJid, text) {
   const value = String(text || "").trim();
+
   if (!value) return null;
 
-  return socket.sendMessage(
-    remoteJid,
-    {
-      text: value
-    }
-  );
+  return socket.sendMessage(remoteJid, {
+    text: value
+  });
 }
 
 async function sendImage(socket, remoteJid, imageUrl, caption) {
   if (!imageUrl) return null;
 
-  return socket.sendMessage(
-    remoteJid,
-    {
-      image: {
-        url: imageUrl
-      },
-      caption: String(caption || "").trim()
-    }
-  );
+  return socket.sendMessage(remoteJid, {
+    image: { url: imageUrl },
+    caption: String(caption || "").trim()
+  });
 }
 
 /*
@@ -372,9 +569,6 @@ async function sendImage(socket, remoteJid, imageUrl, caption) {
  * 1. AI reply containing the new promotion introduction.
  * 2. Real promotion/package flyer(s).
  * 3. Product answer image, when there is a clear product match.
- *
- * If there is no promotion introduction, the previous product-image
- * behavior remains unchanged.
  */
 async function sendReply({
   socket,
@@ -384,17 +578,12 @@ async function sendReply({
   productImageUrl,
   matchedProduct
 }) {
-  const promotions =
-    Array.isArray(promotionAssets)
-      ? promotionAssets
-      : [];
+  const promotions = Array.isArray(promotionAssets)
+    ? promotionAssets
+    : [];
 
   if (promotions.length > 0) {
-    await sendText(
-      socket,
-      remoteJid,
-      reply
-    );
+    await sendText(socket, remoteJid, reply);
 
     for (const promotion of promotions) {
       if (!promotion?.imageUrl) continue;
@@ -402,9 +591,7 @@ async function sendReply({
       const captionParts = [];
 
       if (promotion.title) {
-        captionParts.push(
-          String(promotion.title).trim()
-        );
+        captionParts.push(String(promotion.title).trim());
       }
 
       if (
@@ -425,10 +612,6 @@ async function sendReply({
       );
     }
 
-    /*
-     * If the customer also asked about a specific product,
-     * its real product image comes after the promotion.
-     */
     if (productImageUrl && matchedProduct) {
       await sendImage(
         socket,
@@ -441,10 +624,6 @@ async function sendReply({
     return;
   }
 
-  /*
-   * No promotion introduction: preserve the normal product
-   * image behavior.
-   */
   if (productImageUrl && matchedProduct) {
     try {
       return await sendImage(
@@ -464,11 +643,7 @@ async function sendReply({
     }
   }
 
-  return sendText(
-    socket,
-    remoteJid,
-    reply
-  );
+  return sendText(socket, remoteJid, reply);
 }
 
 /* =========================================================
@@ -480,25 +655,15 @@ async function handleIncomingMessage({
   message,
   socket
 }) {
-  const remoteJid =
-    message?.key?.remoteJid || "";
-
-  const fromMe =
-    Boolean(message?.key?.fromMe);
-
-  const messageId =
-    message?.key?.id || "";
+  const remoteJid = message?.key?.remoteJid || "";
+  const fromMe = Boolean(message?.key?.fromMe);
+  const messageId = message?.key?.id || "";
 
   if (!remoteJid || !messageId) {
     return;
   }
 
-  if (
-    shouldIgnore(
-      remoteJid,
-      fromMe
-    )
-  ) {
+  if (shouldIgnore(remoteJid, fromMe)) {
     return;
   }
 
@@ -508,41 +673,38 @@ async function handleIncomingMessage({
 
   rememberMessage(messageId);
 
-  const text =
-    extractText(message);
+  const text = extractText(message);
 
   if (!text) return;
 
-  const whatsappSocket =
-    socket || session?.socket;
+  const whatsappSocket = socket || session?.socket;
 
   if (!whatsappSocket) {
     logger.error(
-      {
-        businessId:
-          session?.businessId
-      },
+      { businessId: session?.businessId },
       "WhatsApp socket is unavailable."
     );
     return;
   }
 
-  const customerPhone =
-    phoneFromJid(remoteJid);
+  const businessId = session?.businessId;
 
-  const customerName =
-    extractCustomerName(message);
+  if (!businessId) {
+    logger.error(
+      { sessionId: session?.sessionId },
+      "Incoming message has no business ID."
+    );
+    return;
+  }
 
-  const customerKey =
-    customerPhone ||
-    remoteJid;
+  const customerPhone = phoneFromJid(remoteJid);
+  const customerName = extractCustomerName(message);
+  const customerKey = customerPhone || remoteJid;
 
   logger.info(
     {
-      sessionId:
-        session?.sessionId,
-      businessId:
-        session?.businessId,
+      sessionId: session?.sessionId,
+      businessId,
       customerPhone,
       customerName,
       messageId,
@@ -557,27 +719,16 @@ async function handleIncomingMessage({
 
   try {
     await saveMessage({
-      business_id:
-        session.businessId,
-      channel:
-        "whatsapp",
-      direction:
-        "inbound",
-      customer_phone:
-        customerPhone,
-      message:
-        text,
-      message_id:
-        messageId
+      business_id: businessId,
+      channel: "whatsapp",
+      direction: "inbound",
+      customer_phone: customerPhone,
+      message: text,
+      message_id: messageId
     });
   } catch (error) {
     logger.warn(
-      {
-        businessId:
-          session.businessId,
-        error:
-          error.message
-      },
+      { businessId, error: error.message },
       "Incoming message persistence failed."
     );
   }
@@ -588,27 +739,19 @@ async function handleIncomingMessage({
 
   try {
     await upsertCustomer({
-      business_id:
-        session.businessId,
-      channel:
-        "whatsapp",
-      channel_customer_id:
-        customerKey,
-      phone:
-        customerPhone || null,
-      last_message:
-        text,
-      updated_at:
-        new Date().toISOString()
+      business_id: businessId,
+      channel: "whatsapp",
+      channel_customer_id: customerKey,
+      phone: customerPhone || null,
+      last_message: text,
+      updated_at: new Date().toISOString()
     });
   } catch (error) {
     logger.warn(
       {
-        businessId:
-          session.businessId,
+        businessId,
         customerPhone,
-        error:
-          error.message
+        error: error.message
       },
       "Customer persistence failed."
     );
@@ -621,33 +764,53 @@ async function handleIncomingMessage({
   let business;
 
   try {
-    business =
-      await getBusinessById(
-        session.businessId
-      );
+    business = await getBusinessById(businessId);
   } catch (error) {
     logger.error(
-      {
-        businessId:
-          session.businessId,
-        error:
-          error.message
-      },
-      "Business lookup failed."
+      { businessId, error: error.message },
+      "Business lookup failed. AI reply blocked."
     );
-    return;
+
+    return {
+      ok: false,
+      reason: "business_lookup_failed"
+    };
   }
 
   if (!business) {
     logger.error(
-      {
-        businessId:
-          session.businessId
-      },
-      "Business was not found."
+      { businessId },
+      "Business was not found. AI reply blocked."
     );
-    return;
+
+    return {
+      ok: false,
+      reason: "business_not_found"
+    };
   }
+
+  /* =======================================================
+     SUBSCRIPTION GATE
+  ======================================================= */
+
+  const subscription = getSubscriptionState(business);
+
+  if (!subscription.active) {
+    return handleExpiredSubscription({
+      business,
+      businessId,
+      socket: whatsappSocket
+    });
+  }
+
+  /* =======================================================
+     EXISTING AUTOMATION FLAGS
+  ======================================================= */
+
+  /*
+   * Do not change the existing AI/automation settings here.
+   * Subscription status and expiry are checked independently.
+   */
 
   /* =======================================================
      LOAD PRODUCT CATALOG
@@ -656,27 +819,20 @@ async function handleIncomingMessage({
   let catalog = [];
 
   try {
-    catalog =
-      await getBusinessCatalog(
-        session.businessId
-      );
+    catalog = await getBusinessCatalog(businessId);
 
     logger.info(
       {
-        businessId:
-          session.businessId,
-        catalogCount:
-          catalog.length
+        businessId,
+        catalogCount: catalog.length
       },
       "Business product catalog loaded."
     );
   } catch (error) {
     logger.warn(
       {
-        businessId:
-          session.businessId,
-        error:
-          error.message
+        businessId,
+        error: error.message
       },
       "Product catalog lookup failed. Continuing without catalog."
     );
@@ -684,16 +840,8 @@ async function handleIncomingMessage({
     catalog = [];
   }
 
-  const relevantProducts =
-    findRelevantProducts(
-      catalog,
-      text
-    );
-
-  const productContext =
-    buildProductContext(
-      relevantProducts
-    );
+  const relevantProducts = findRelevantProducts(catalog, text);
+  const productContext = buildProductContext(relevantProducts);
 
   /* =======================================================
      LOAD NEW ACTIVE PROMOTIONS
@@ -702,42 +850,26 @@ async function handleIncomingMessage({
   let pendingPromotions = [];
 
   try {
-    /*
-     * This returns only active promotions that this customer
-     * has not already received, or promotions whose content
-     * was updated after the customer last received them.
-     *
-     * Therefore:
-     *
-     * - new customer + active promotion => introduce it
-     * - old customer + brand-new promotion => introduce it
-     * - old customer + unchanged old promotion => don't repeat
-     * - updated promotion => introduce updated version once
-     */
     pendingPromotions =
       await getPromotionsForCustomerIntro(
-        session.businessId,
+        businessId,
         customerKey
       );
 
     logger.info(
       {
-        businessId:
-          session.businessId,
+        businessId,
         customerKey,
-        promotionCount:
-          pendingPromotions.length
+        promotionCount: pendingPromotions.length
       },
       "Promotion introduction lookup completed."
     );
   } catch (error) {
     logger.warn(
       {
-        businessId:
-          session.businessId,
+        businessId,
         customerKey,
-        error:
-          error.message
+        error: error.message
       },
       "Promotion lookup failed. Continuing without promotions."
     );
@@ -745,32 +877,21 @@ async function handleIncomingMessage({
     pendingPromotions = [];
   }
 
-  const promotionContext =
-    pendingPromotions.map(
-      (promotion) => ({
-        id:
-          promotion.id,
-        title:
-          promotion.title || null,
-        description:
-          promotion.description || null,
-        price:
-          promotion.price ?? null,
-        currency:
-          promotion.currency || "AED",
-        promotion_type:
-          promotion.promotion_type || null,
-        valid_from:
-          promotion.valid_from || null,
-        valid_until:
-          promotion.valid_until || null,
-        has_image:
-          Array.isArray(
-            promotion.images
-          ) &&
-          promotion.images.length > 0
-      })
-    );
+  const promotionContext = pendingPromotions.map(
+    (promotion) => ({
+      id: promotion.id,
+      title: promotion.title || null,
+      description: promotion.description || null,
+      price: promotion.price ?? null,
+      currency: promotion.currency || "AED",
+      promotion_type: promotion.promotion_type || null,
+      valid_from: promotion.valid_from || null,
+      valid_until: promotion.valid_until || null,
+      has_image:
+        Array.isArray(promotion.images) &&
+        promotion.images.length > 0
+    })
+  );
 
   /* =======================================================
      GENERATE AI REPLY
@@ -779,28 +900,21 @@ async function handleIncomingMessage({
   let result;
 
   try {
-    result =
-      await generateReply({
-        business,
-        customerPhone,
-        customerName,
-        messageText:
-          text,
-        products:
-          productContext,
-        promotions:
-          promotionContext,
-        introducePromotions:
-          pendingPromotions.length > 0
-      });
+    result = await generateReply({
+      business,
+      customerPhone,
+      customerName,
+      messageText: text,
+      products: productContext,
+      promotions: promotionContext,
+      introducePromotions: pendingPromotions.length > 0
+    });
   } catch (error) {
     logger.error(
       {
-        businessId:
-          session.businessId,
+        businessId,
         customerPhone,
-        error:
-          error.message
+        error: error.message
       },
       "AI reply generation failed."
     );
@@ -808,17 +922,11 @@ async function handleIncomingMessage({
     return;
   }
 
-  if (
-    !result ||
-    !result.ok
-  ) {
+  if (!result || !result.ok) {
     logger.warn(
       {
-        businessId:
-          session.businessId,
-        error:
-          result?.error ||
-          "Unknown AI error"
+        businessId,
+        error: result?.error || "Unknown AI error"
       },
       "AI did not return a usable reply."
     );
@@ -826,17 +934,11 @@ async function handleIncomingMessage({
     return;
   }
 
-  const reply =
-    String(
-      result.reply || ""
-    ).trim();
+  const reply = String(result.reply || "").trim();
 
   if (!reply) {
     logger.warn(
-      {
-        businessId:
-          session.businessId
-      },
+      { businessId },
       "AI returned an empty reply."
     );
 
@@ -849,30 +951,17 @@ async function handleIncomingMessage({
 
   const promotionAssets = [];
 
-  if (pendingPromotions.length > 0) {
-    for (
-      const promotion
-      of pendingPromotions
-    ) {
-      const imageUrl =
-        await getPrimaryPromotionImage(
-          promotion
-        );
+  for (const promotion of pendingPromotions) {
+    const imageUrl = await getPrimaryPromotionImage(promotion);
 
-      if (imageUrl) {
-        promotionAssets.push({
-          id:
-            promotion.id,
-          title:
-            promotion.title,
-          price:
-            promotion.price,
-          currency:
-            promotion.currency ||
-            "AED",
-          imageUrl
-        });
-      }
+    if (imageUrl) {
+      promotionAssets.push({
+        id: promotion.id,
+        title: promotion.title,
+        price: promotion.price,
+        currency: promotion.currency || "AED",
+        imageUrl
+      });
     }
   }
 
@@ -880,22 +969,14 @@ async function handleIncomingMessage({
      PRODUCT IMAGE
   ======================================================= */
 
-  let productImageUrl =
-    null;
+  let productImageUrl = null;
+  let matchedProduct = null;
 
-  let matchedProduct =
-    null;
-
-  if (
-    relevantProducts.length === 1
-  ) {
-    matchedProduct =
-      relevantProducts[0];
+  if (relevantProducts.length === 1) {
+    matchedProduct = relevantProducts[0];
 
     productImageUrl =
-      await getPrimaryProductImage(
-        matchedProduct
-      );
+      await getPrimaryProductImage(matchedProduct);
   }
 
   /* =======================================================
@@ -905,24 +986,20 @@ async function handleIncomingMessage({
   let sent;
 
   try {
-    sent =
-      await sendReply({
-        socket:
-          whatsappSocket,
-        remoteJid,
-        reply,
-        promotionAssets,
-        productImageUrl,
-        matchedProduct
-      });
+    sent = await sendReply({
+      socket: whatsappSocket,
+      remoteJid,
+      reply,
+      promotionAssets,
+      productImageUrl,
+      matchedProduct
+    });
   } catch (error) {
     logger.error(
       {
-        businessId:
-          session.businessId,
+        businessId,
         customerPhone,
-        error:
-          error.message
+        error: error.message
       },
       "WhatsApp reply send failed."
     );
@@ -934,33 +1011,22 @@ async function handleIncomingMessage({
      MARK PROMOTIONS AS INTRODUCED
   ======================================================= */
 
-  if (
-    pendingPromotions.length > 0
-  ) {
-    for (
-      const promotion
-      of pendingPromotions
-    ) {
+  if (pendingPromotions.length > 0) {
+    for (const promotion of pendingPromotions) {
       try {
         await markPromotionIntroduced({
-          businessId:
-            session.businessId,
-          promotionId:
-            promotion.id,
+          businessId,
+          promotionId: promotion.id,
           customerKey,
-          promotionUpdatedAt:
-            promotion.updated_at
+          promotionUpdatedAt: promotion.updated_at
         });
       } catch (error) {
         logger.warn(
           {
-            businessId:
-              session.businessId,
-            promotionId:
-              promotion.id,
+            businessId,
+            promotionId: promotion.id,
             customerKey,
-            error:
-              error.message
+            error: error.message
           },
           "Promotion introduction state could not be saved."
         );
@@ -974,73 +1040,44 @@ async function handleIncomingMessage({
 
   try {
     await saveMessage({
-      business_id:
-        session.businessId,
-      channel:
-        "whatsapp",
-      direction:
-        "outbound",
-      customer_phone:
-        customerPhone,
-      message:
-        reply,
-      message_id:
-        sent?.key?.id || null,
+      business_id: businessId,
+      channel: "whatsapp",
+      direction: "outbound",
+      customer_phone: customerPhone,
+      message: reply,
+      message_id: sent?.key?.id || null,
       metadata: {
-        customer_name:
-          customerName || null,
-        promotions_introduced:
-          pendingPromotions.map(
-            (promotion) => ({
-              id:
-                promotion.id,
-              title:
-                promotion.title
-            })
-          ),
-        promotion_images_sent:
-          promotionAssets.length,
-        product_id:
-          matchedProduct?.id ||
-          null,
-        product_name:
-          matchedProduct?.product_name ||
-          null,
-        product_image_sent:
-          Boolean(productImageUrl)
+        customer_name: customerName || null,
+        promotions_introduced: pendingPromotions.map(
+          (promotion) => ({
+            id: promotion.id,
+            title: promotion.title
+          })
+        ),
+        promotion_images_sent: promotionAssets.length,
+        product_id: matchedProduct?.id || null,
+        product_name: matchedProduct?.product_name || null,
+        product_image_sent: Boolean(productImageUrl)
       }
     });
   } catch (error) {
     logger.warn(
-      {
-        businessId:
-          session.businessId,
-        error:
-          error.message
-      },
+      { businessId, error: error.message },
       "Outgoing message persistence failed."
     );
   }
 
   logger.info(
     {
-      sessionId:
-        session?.sessionId,
-      businessId:
-        session.businessId,
+      sessionId: session?.sessionId,
+      businessId,
       customerPhone,
       customerName,
-      messageId:
-        sent?.key?.id || null,
-      promotionsIntroduced:
-        pendingPromotions.length,
-      promotionImagesSent:
-        promotionAssets.length,
-      productId:
-        matchedProduct?.id ||
-        null,
-      productImageSent:
-        Boolean(productImageUrl)
+      messageId: sent?.key?.id || null,
+      promotionsIntroduced: pendingPromotions.length,
+      promotionImagesSent: promotionAssets.length,
+      productId: matchedProduct?.id || null,
+      productImageSent: Boolean(productImageUrl)
     },
     "WhatsApp AI reply completed."
   );
@@ -1048,28 +1085,19 @@ async function handleIncomingMessage({
   return {
     ok: true,
     reply,
-    promotions:
-      pendingPromotions.map(
-        (promotion) => ({
-          id:
-            promotion.id,
-          title:
-            promotion.title
-        })
-      ),
-    product:
-      matchedProduct
-        ? {
-            id:
-              matchedProduct.id,
-            name:
-              matchedProduct.product_name,
-            imageSent:
-              Boolean(
-                productImageUrl
-              )
-          }
-        : null
+    promotions: pendingPromotions.map(
+      (promotion) => ({
+        id: promotion.id,
+        title: promotion.title
+      })
+    ),
+    product: matchedProduct
+      ? {
+          id: matchedProduct.id,
+          name: matchedProduct.product_name,
+          imageSent: Boolean(productImageUrl)
+        }
+      : null
   };
 }
 
