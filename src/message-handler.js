@@ -101,10 +101,72 @@ function extractText(message) {
     m.videoMessage?.caption ||
     m.documentMessage?.caption ||
     m.buttonsResponseMessage?.selectedDisplayText ||
+    m.buttonsResponseMessage?.selectedButtonId ||
     m.listResponseMessage?.title ||
+    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
     m.templateButtonReplyMessage?.selectedDisplayText ||
+    m.templateButtonReplyMessage?.selectedId ||
+    m.interactiveResponseMessage?.body?.text ||
+    m.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson ||
     ""
   ).trim();
+}
+
+function normalizeMenuChoice(value) {
+  const text = String(value || "")
+    .toLowerCase()
+    .replace(/[🏷️🛍️🛒📦]/gu, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+
+  if (
+    /^(?:sodah menu promotions|view current promotions|current promotions|view promotions|promotions|promotion|offers|offer|discounts|discount|1)$/.test(text) ||
+    /\b(view|show|see|check)\b.*\b(promotions?|offers?|discounts?)\b/.test(text)
+  ) return "promotions";
+
+  if (
+    /^(?:sodah menu products|view our products|our products|view products|products|product|catalog|catalogue|2)$/.test(text) ||
+    /\b(view|show|see|browse)\b.*\b(products?|catalogue?)\b/.test(text)
+  ) return "products";
+
+  return "";
+}
+
+function isGreeting(value) {
+  const text = String(value || "").toLowerCase().trim();
+  return /^(hi|hello|hey|good morning|good afternoon|good evening|assalamu alaikum|salam|مرحبا|السلام عليكم)[!.\s🙏👋]*$/u.test(text);
+}
+
+function buildWelcomeMenu(business) {
+  const name = String(business?.business_name || "our business").trim();
+  return `Hi there 👋 welcome to ${name}. How may I help you today?\n\n🏷️ View Current Promotions\n🛍️ View Our Products\n\nReply with “View Current Promotions” or “View Our Products” to continue.`;
+}
+
+function formatPrice(item) {
+  if (item?.price === null || item?.price === undefined || item?.price === "") return "Price not listed";
+  return `${item.currency || "AED"} ${item.price}`;
+}
+
+function buildPromotionList(business, promotions) {
+  const name = String(business?.business_name || "our business").trim();
+  if (!promotions.length) return `There are no current active promotions from ${name} right now.`;
+  const lines = promotions.map((p, i) => {
+    const details = [p.description, p.price !== null && p.price !== undefined && p.price !== "" ? formatPrice(p) : ""]
+      .filter(Boolean).join(" — ");
+    return `${i + 1}. ${p.title || "Current promotion"}${details ? `\n   ${details}` : ""}`;
+  });
+  return `🏷️ Current Promotions from ${name}\n\n${lines.join("\n\n")}`;
+}
+
+function buildProductList(business, products) {
+  const name = String(business?.business_name || "our business").trim();
+  if (!products.length) return `There are no active products listed by ${name} right now.`;
+  const lines = products.map((p, i) => {
+    const details = [formatPrice(p), p.availability ? `Availability: ${p.availability}` : ""]
+      .filter(Boolean).join(" • ");
+    return `${i + 1}. ${p.product_name || "Product"}${details ? `\n   ${details}` : ""}`;
+  });
+  return `🛍️ Products from ${name}\n\n${lines.join("\n\n")}`;
 }
 
 /* =========================================================
@@ -842,6 +904,121 @@ async function handleIncomingMessage({
 
   const relevantProducts = findRelevantProducts(catalog, text);
   const productContext = buildProductContext(relevantProducts);
+  const menuChoice = normalizeMenuChoice(text);
+
+  // First contact shows the two explicit choices instead of unsolicited
+  // promotion copy. The menu can also be re-opened with a greeting later.
+  if (isGreeting(text) && !menuChoice) {
+    const reply = buildWelcomeMenu(business);
+    try {
+      const sent = await sendText(whatsappSocket, remoteJid, reply);
+      try {
+        await saveMessage({
+          business_id: businessId,
+          channel: "whatsapp",
+          direction: "outbound",
+          customer_phone: customerPhone,
+          message: reply,
+          message_id: sent?.key?.id || null,
+          metadata: { menu: "welcome", options: ["promotions", "products"] }
+        });
+      } catch (error) {
+        logger.warn({ businessId, error: error.message }, "Welcome menu persistence failed.");
+      }
+      return { ok: true, reply, menu: true };
+    } catch (error) {
+      logger.error({ businessId, error: error.message }, "Welcome menu send failed.");
+      return { ok: false, reason: "welcome_menu_send_failed" };
+    }
+  }
+
+  if (menuChoice === "promotions" || menuChoice === "products") {
+    let reply;
+    let sent;
+    let imageSent = false;
+    let promotionsToMark = [];
+    let productImageProduct = null;
+
+    try {
+      if (menuChoice === "promotions") {
+        const activePromotions = await getPromotionsForCustomerIntro(
+          businessId,
+          customerKey,
+          { includeAll: true }
+        );
+        promotionsToMark = activePromotions;
+        reply = buildPromotionList(business, activePromotions);
+        sent = await sendText(whatsappSocket, remoteJid, reply);
+
+        // Only the first eligible promotion image is sent; never blast every flyer.
+        for (const promotion of activePromotions) {
+          const imageUrl = await getPrimaryPromotionImage(promotion);
+          if (!imageUrl) continue;
+          await sendImage(whatsappSocket, remoteJid, imageUrl, promotion.title || "Current promotion");
+          imageSent = true;
+          break;
+        }
+      } else {
+        reply = buildProductList(business, catalog);
+        sent = await sendText(whatsappSocket, remoteJid, reply);
+
+        // Product selection sends at most one product image, and never a promotion flyer.
+        for (const product of catalog) {
+          const imageUrl = await getPrimaryProductImage(product);
+          if (!imageUrl) continue;
+          productImageProduct = product;
+          await sendImage(whatsappSocket, remoteJid, imageUrl, product.product_name || "Product");
+          imageSent = true;
+          break;
+        }
+      }
+
+      for (const promotion of promotionsToMark) {
+        try {
+          await markPromotionIntroduced({
+            businessId,
+            promotionId: promotion.id,
+            customerKey,
+            promotionUpdatedAt: promotion.updated_at
+          });
+        } catch (error) {
+          logger.warn({ businessId, promotionId: promotion.id, error: error.message }, "Promotion view tracking failed.");
+        }
+      }
+
+      try {
+        await saveMessage({
+          business_id: businessId,
+          channel: "whatsapp",
+          direction: "outbound",
+          customer_phone: customerPhone,
+          message: reply,
+          message_id: sent?.key?.id || null,
+          metadata: {
+            menu: menuChoice,
+            promotion_count: promotionsToMark.length,
+            product_count: menuChoice === "products" ? catalog.length : 0,
+            image_sent: imageSent,
+            product_id: productImageProduct?.id || null
+          }
+        });
+      } catch (error) {
+        logger.warn({ businessId, error: error.message }, "Menu response persistence failed.");
+      }
+
+      return {
+        ok: true,
+        reply,
+        menu: menuChoice,
+        imageSent,
+        promotionCount: promotionsToMark.length,
+        productCount: menuChoice === "products" ? catalog.length : 0
+      };
+    } catch (error) {
+      logger.error({ businessId, menuChoice, error: error.message }, "Menu selection response failed.");
+      return { ok: false, reason: "menu_selection_failed" };
+    }
+  }
 
   /* =======================================================
      LOAD NEW ACTIVE PROMOTIONS
@@ -953,16 +1130,15 @@ async function handleIncomingMessage({
 
   for (const promotion of pendingPromotions) {
     const imageUrl = await getPrimaryPromotionImage(promotion);
-
-    if (imageUrl) {
-      promotionAssets.push({
-        id: promotion.id,
-        title: promotion.title,
-        price: promotion.price,
-        currency: promotion.currency || "AED",
-        imageUrl
-      });
-    }
+    if (!imageUrl) continue;
+    promotionAssets.push({
+      id: promotion.id,
+      title: promotion.title,
+      price: promotion.price,
+      currency: promotion.currency || "AED",
+      imageUrl
+    });
+    break; // One eligible promotion image per reply.
   }
 
   /* =======================================================
@@ -1109,5 +1285,10 @@ module.exports = {
   handleIncomingMessage,
   extractText,
   phoneFromJid,
-  extractCustomerName
+  extractCustomerName,
+  normalizeMenuChoice,
+  isGreeting,
+  buildWelcomeMenu,
+  buildPromotionList,
+  buildProductList
 };
