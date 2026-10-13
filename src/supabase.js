@@ -642,8 +642,9 @@ async function getProductImageUrl(
    PROMOTIONS
 ========================================================= */
 
-async function getPromotionsForCustomerIntro(businessId, customerKey) {
-  if (!businessId || !customerKey) return [];
+async function getPromotionsForCustomerIntro(businessId, customerKey, options = {}) {
+  const includeAll = options?.includeAll === true;
+  if (!businessId || (!customerKey && !includeAll)) return [];
 
   const now = new Date().toISOString();
 
@@ -735,6 +736,17 @@ async function getPromotionsForCustomerIntro(businessId, customerKey) {
     }
   }
 
+  const promotionsWithImages = promotions.map((promotion) => ({
+    ...promotion,
+    images: (imagesByPromotion.get(promotion.id) || []).sort(
+      (a, b) => a.sort_order - b.sort_order
+    )
+  }));
+
+  // Explicit "View Current Promotions" requests must show every currently
+  // active promotion, regardless of whether it was introduced previously.
+  if (includeAll) return promotionsWithImages;
+
   let introductions = [];
 
   try {
@@ -770,7 +782,7 @@ async function getPromotionsForCustomerIntro(businessId, customerKey) {
     introMap.set(String(intro.promotion_id), intro);
   }
 
-  return promotions
+  return promotionsWithImages
     .filter((promotion) => {
       const previous = introMap.get(String(promotion.id));
 
@@ -785,13 +797,7 @@ async function getPromotionsForCustomerIntro(businessId, customerKey) {
         : 0;
 
       return currentVersion > previousVersion;
-    })
-    .map((promotion) => ({
-      ...promotion,
-      images: (imagesByPromotion.get(promotion.id) || []).sort(
-        (a, b) => a.sort_order - b.sort_order
-      )
-    }));
+    });
 }
 
 async function markPromotionIntroduced({
