@@ -308,18 +308,26 @@ function publicSession(session) {
 */
 
 function extractMessageText(message) {
-  if (!message?.message) {
-    return "";
+  let content = message?.message;
+  // Baileys may wrap user messages in ephemeral or view-once containers.
+  for (let i = 0; i < 5 && content; i += 1) {
+    const wrapped = content.ephemeralMessage?.message ||
+      content.viewOnceMessage?.message ||
+      content.viewOnceMessageV2?.message ||
+      content.documentWithCaptionMessage?.message;
+    if (!wrapped) break;
+    content = wrapped;
   }
-
-  return (
-    message.message.conversation ||
-    message.message.extendedTextMessage?.text ||
-    message.message.imageMessage?.caption ||
-    message.message.videoMessage?.caption ||
-    message.message.documentMessage?.caption ||
-    ""
-  );
+  if (!content) return "";
+  const selected = content.buttonsResponseMessage?.selectedDisplayText ||
+    content.buttonsResponseMessage?.selectedButtonId ||
+    content.listResponseMessage?.title ||
+    content.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    content.templateButtonReplyMessage?.selectedDisplayText ||
+    content.templateButtonReplyMessage?.selectedId;
+  return String(content.conversation || content.extendedTextMessage?.text ||
+    content.imageMessage?.caption || content.videoMessage?.caption ||
+    content.documentMessage?.caption || selected || "").trim();
 }
 
 /*
