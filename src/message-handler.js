@@ -13,6 +13,13 @@ const {
   getProductImageUrl,
   getPromotionsForCustomerIntro,
   markPromotionIntroduced,
+  loadConversationHistory,
+  saveConversationMessage,
+  getSentMediaImageKeys,
+  claimMediaImage,
+  finishMediaImage,
+  getConversationControl,
+  setConversationControl,
   saveMessage,
   upsertCustomer,
   reserveSubscriptionExpiryReminder
@@ -23,6 +30,7 @@ const {
 ========================================================= */
 
 const processed = new Map();
+const automatedMessageIds = new Set();
 
 const ttlMs =
   Number(process.env.MESSAGE_DEDUP_TTL_SECONDS || 120) *
@@ -42,6 +50,22 @@ function rememberMessage(id) {
       }
     }
   }
+}
+
+function markAutomatedMessage(result) {
+  const id = result?.key?.id;
+  if (!id) return result;
+  automatedMessageIds.add(id);
+  if (automatedMessageIds.size > 5000) {
+    automatedMessageIds.delete(automatedMessageIds.values().next().value);
+  }
+  return result;
+}
+
+function wasAutomatedMessage(messageId) {
+  if (!messageId || !automatedMessageIds.has(messageId)) return false;
+  automatedMessageIds.delete(messageId);
+  return true;
 }
 
 /* =========================================================
@@ -101,72 +125,10 @@ function extractText(message) {
     m.videoMessage?.caption ||
     m.documentMessage?.caption ||
     m.buttonsResponseMessage?.selectedDisplayText ||
-    m.buttonsResponseMessage?.selectedButtonId ||
     m.listResponseMessage?.title ||
-    m.listResponseMessage?.singleSelectReply?.selectedRowId ||
     m.templateButtonReplyMessage?.selectedDisplayText ||
-    m.templateButtonReplyMessage?.selectedId ||
-    m.interactiveResponseMessage?.body?.text ||
-    m.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson ||
     ""
   ).trim();
-}
-
-function normalizeMenuChoice(value) {
-  const text = String(value || "")
-    .toLowerCase()
-    .replace(/[🏷️🛍️🛒📦]/gu, " ")
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .trim();
-
-  if (
-    /^(?:sodah menu promotions|view current promotions|current promotions|view promotions|promotions|promotion|offers|offer|discounts|discount|1)$/.test(text) ||
-    /\b(view|show|see|check)\b.*\b(promotions?|offers?|discounts?)\b/.test(text)
-  ) return "promotions";
-
-  if (
-    /^(?:sodah menu products|view our products|our products|view products|products|product|catalog|catalogue|2)$/.test(text) ||
-    /\b(view|show|see|browse)\b.*\b(products?|catalogue?)\b/.test(text)
-  ) return "products";
-
-  return "";
-}
-
-function isGreeting(value) {
-  const text = String(value || "").toLowerCase().trim();
-  return /^(hi|hello|hey|good morning|good afternoon|good evening|assalamu alaikum|salam|مرحبا|السلام عليكم)[!.\s🙏👋]*$/u.test(text);
-}
-
-function buildWelcomeMenu(business) {
-  const name = String(business?.business_name || "our business").trim();
-  return `Hi there 👋 welcome to ${name}. How may I help you today?\n\n🏷️ View Current Promotions\n🛍️ View Our Products\n\nReply with “View Current Promotions” or “View Our Products” to continue.`;
-}
-
-function formatPrice(item) {
-  if (item?.price === null || item?.price === undefined || item?.price === "") return "Price not listed";
-  return `${item.currency || "AED"} ${item.price}`;
-}
-
-function buildPromotionList(business, promotions) {
-  const name = String(business?.business_name || "our business").trim();
-  if (!promotions.length) return `There are no current active promotions from ${name} right now.`;
-  const lines = promotions.map((p, i) => {
-    const details = [p.description, p.price !== null && p.price !== undefined && p.price !== "" ? formatPrice(p) : ""]
-      .filter(Boolean).join(" — ");
-    return `${i + 1}. ${p.title || "Current promotion"}${details ? `\n   ${details}` : ""}`;
-  });
-  return `🏷️ Current Promotions from ${name}\n\n${lines.join("\n\n")}`;
-}
-
-function buildProductList(business, products) {
-  const name = String(business?.business_name || "our business").trim();
-  if (!products.length) return `There are no active products listed by ${name} right now.`;
-  const lines = products.map((p, i) => {
-    const details = [formatPrice(p), p.availability ? `Availability: ${p.availability}` : ""]
-      .filter(Boolean).join(" • ");
-    return `${i + 1}. ${p.product_name || "Product"}${details ? `\n   ${details}` : ""}`;
-  });
-  return `🛍️ Products from ${name}\n\n${lines.join("\n\n")}`;
 }
 
 /* =========================================================
@@ -402,10 +364,88 @@ function normalizeText(value) {
 }
 
 function tokenize(value) {
+  const stopWords = new Set([
+    "a", "an", "and", "are", "as", "at", "be", "can", "do", "does", "for", "from",
+    "have", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "our",
+    "please", "the", "their", "this", "to", "us", "we", "what", "when", "where",
+    "which", "who", "with", "would", "you", "your", "much", "price", "cost", "sell",
+    "offer", "available", "availability", "show", "send", "share", "image", "images",
+    "picture", "pictures", "photo", "photos", "see", "look", "about", "its", "those",
+    "another", "again", "one", "product", "products", "item", "items", "catalog", "catalogue"
+  ]);
   return normalizeText(value)
     .split(" ")
     .map((token) => token.trim())
-    .filter((token) => token.length >= 2);
+    .filter((token) => token.length >= 2 && !stopWords.has(token));
+}
+
+function isImageRequest(text) {
+  const normalized = normalizeText(text);
+  return /\b(show|send|share|see|view|look at)\b/.test(normalized) &&
+    /\b(image|images|picture|pictures|photo|photos|flyer|flyers)\b/.test(normalized);
+}
+
+function isPromotionImageRequest(text, history = []) {
+  if (!isImageRequest(text)) return false;
+  const recent = [
+    ...history.slice(-6).map((message) => message.content || ""),
+    text
+  ].join(" ");
+  return /\b(promotion|promotions|promo|promos|offer|offers|deal|deals|discount|flyer)\b/i.test(recent);
+}
+
+function isPromotionQuestion(text) {
+  return /\b(promotion|promotions|promo|promos|offer|offers|deal|deals|discount|sale)\b/i.test(String(text || ""));
+}
+
+function isProductInquiry(text) {
+  return /\b(how much|price|cost|do you have|do you sell|available|in stock|buy|purchase|order|show me|tell me about|image|picture|photo|products?|items?|catalog|catalogue)\b/i.test(String(text || ""));
+}
+
+function isGenericProductListRequest(text) {
+  const value = normalizeText(text);
+  return /\b(what|which|show|list|tell me|browse)\b/.test(value) &&
+    /\b(products?|items?|catalog|catalogue|collection|do you sell|do you offer|what do you have|available options)\b/.test(value);
+}
+
+function mediaImageKey(image) {
+  return String(image?.id || image?.storage_path || image?.image_url || "").trim();
+}
+
+function isExplicitBotIdentity(text) {
+  return /\b(as an ai (?:language )?model|i am an ai(?: assistant)?|i'm an ai(?: assistant)?|i am a bot|i'm a bot|i am an automated assistant|i'm an automated assistant)\b/i.test(String(text || ""));
+}
+
+function looksLikeBotTemplate(text) {
+  return /\b(thank you for reaching out|thanks for contacting|how can i assist you|how may i assist|please provide your (request|requirements|details)|your request is important|automated response|virtual agent)\b/i.test(String(text || ""));
+}
+
+function likelyAiToAiLoop(history, text) {
+  if (isExplicitBotIdentity(text)) return true;
+
+  const timeline = [
+    ...(Array.isArray(history) ? history : []),
+    { role: "user", content: text, at: new Date().toISOString() }
+  ].slice(-12);
+  const users = timeline.filter((message) => message.role === "user").slice(-4);
+  const templateCount = users.filter((message) => looksLikeBotTemplate(message.content)).length;
+  if (users.length < 3 || templateCount < 3) return false;
+
+  let fastReplies = 0;
+  for (const userMessage of users.slice(1)) {
+    const userTime = new Date(userMessage.at || 0).getTime();
+    const previousAssistant = [...timeline]
+      .reverse()
+      .find((message) => message.role === "assistant" &&
+        new Date(message.at || 0).getTime() < userTime);
+    if (!previousAssistant) continue;
+    const assistantTime = new Date(previousAssistant.at || 0).getTime();
+    if (Number.isFinite(assistantTime) && userTime - assistantTime <= 2 * 60 * 1000) {
+      fastReplies += 1;
+    }
+  }
+
+  return fastReplies >= 2;
 }
 
 /* =========================================================
@@ -611,101 +651,233 @@ async function sendText(socket, remoteJid, text) {
 
   if (!value) return null;
 
-  return socket.sendMessage(remoteJid, {
+  return markAutomatedMessage(await socket.sendMessage(remoteJid, {
     text: value
-  });
+  }));
+}
+
+async function notifyBusinessOwner({ business, socket, session, customerPhone, customerName, question, reason }) {
+  const ownerPhone = phoneFromJid(
+    business?.owner_phone ||
+    business?.owner_phone_number ||
+    business?.support_number ||
+    business?.contact_phone ||
+    business?.phone_number ||
+    business?.business_phone ||
+    ""
+  );
+  const connectedPhone = phoneFromJid(session?.phoneNumber || "");
+  if (!ownerPhone || ownerPhone === connectedPhone || ownerPhone === customerPhone) {
+    logger.warn(
+      { businessId: business?.business_id, hasSupportNumber: Boolean(ownerPhone) },
+      "Owner handoff notice could not be sent because no separate support number is configured."
+    );
+    return false;
+  }
+
+  const message = [
+    `Sodah handoff for ${business?.business_name || "your business"}`,
+    `Reason: ${reason}`,
+    `Customer: ${customerName || "Customer"}${customerPhone ? ` (${customerPhone})` : ""}`,
+    `Message: ${String(question || "").slice(0, 900)}`,
+    "Reply to the customer directly, then send AI ON in that chat when the AI may resume."
+  ].join("\n");
+
+  await sendText(socket, toWhatsAppJid(ownerPhone), message);
+  return true;
 }
 
 async function sendImage(socket, remoteJid, imageUrl, caption) {
   if (!imageUrl) return null;
 
-  return socket.sendMessage(remoteJid, {
+  return markAutomatedMessage(await socket.sendMessage(remoteJid, {
     image: { url: imageUrl },
     caption: String(caption || "").trim()
-  });
+  }));
 }
 
-/*
- * Promotion-first ordering:
- *
- * 1. AI reply containing the new promotion introduction.
- * 2. Real promotion/package flyer(s).
- * 3. Product answer image, when there is a clear product match.
- */
+async function sendImageOnce({
+  socket,
+  remoteJid,
+  businessId,
+  customerKey,
+  assetType,
+  assetId,
+  image,
+  caption
+}) {
+  const imageKey = mediaImageKey(image);
+  if (!imageKey || !assetId) return { sent: false, result: null };
+
+  const imageUrl = await getProductImageUrl(
+    image,
+    3600,
+    assetType === "promotion"
+      ? process.env.SUPABASE_PROMOTION_IMAGE_BUCKET || "business-promotion-images"
+      : process.env.SUPABASE_PRODUCT_IMAGE_BUCKET || "business-product-images"
+  );
+  if (!imageUrl) return { sent: false, result: null };
+
+  const claimed = await claimMediaImage({
+    businessId,
+    customerKey,
+    assetType,
+    assetId,
+    imageKey
+  });
+  if (!claimed) return { sent: false, result: null };
+
+  try {
+    const result = await sendImage(socket, remoteJid, imageUrl, caption);
+    await finishMediaImage({
+      businessId,
+      customerKey,
+      assetType,
+      assetId,
+      imageKey,
+      sent: true
+    });
+    return { sent: true, result };
+  } catch (error) {
+    try {
+      await finishMediaImage({
+        businessId,
+        customerKey,
+        assetType,
+        assetId,
+        imageKey,
+        sent: false
+      });
+    } catch (stateError) {
+      logger.warn(
+        { businessId, customerKey, assetType, assetId, error: stateError.message },
+        "Failed to release an unsent image delivery claim."
+      );
+    }
+    throw error;
+  }
+}
+
 async function sendReply({
   socket,
   remoteJid,
   reply,
-  promotionAssets,
-  productImageUrl,
-  matchedProduct
+  businessId,
+  customerKey,
+  pendingPromotions = [],
+  allPromotions = [],
+  promotionImageRequest = false,
+  suppressPromotionImage = false,
+  productImageRequest = false,
+  matchedProduct = null
 }) {
-  const promotions = Array.isArray(promotionAssets)
-    ? promotionAssets
-    : [];
+  const promotions = Array.isArray(pendingPromotions) ? pendingPromotions : [];
+  const allActivePromotions = Array.isArray(allPromotions) ? allPromotions : [];
+  const promotionCandidates = promotionImageRequest
+    ? allActivePromotions
+    : promotions;
 
-  if (promotions.length > 0) {
-    await sendText(socket, remoteJid, reply);
-
-    for (const promotion of promotions) {
-      if (!promotion?.imageUrl) continue;
-
-      const captionParts = [];
-
-      if (promotion.title) {
-        captionParts.push(String(promotion.title).trim());
-      }
-
-      if (
-        promotion.price !== null &&
-        promotion.price !== undefined &&
-        promotion.price !== ""
-      ) {
-        captionParts.push(
-          `${promotion.currency || "AED"} ${promotion.price}`
-        );
-      }
-
-      await sendImage(
-        socket,
-        remoteJid,
-        promotion.imageUrl,
-        captionParts.join(" • ")
-      );
-    }
-
-    if (productImageUrl && matchedProduct) {
-      await sendImage(
-        socket,
-        remoteJid,
-        productImageUrl,
-        reply
-      );
-    }
-
-    return;
-  }
-
-  if (productImageUrl && matchedProduct) {
+  // A specific product question gets the matching product image. A promotion
+  // introduction never adds a second image to that reply.
+  if (matchedProduct && !promotionImageRequest) {
+    const images = [...(matchedProduct.images || [])].sort(
+      (a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0)
+    );
+    let sentKeys = new Set();
     try {
-      return await sendImage(
-        socket,
-        remoteJid,
-        productImageUrl,
-        reply
-      );
+      sentKeys = await getSentMediaImageKeys(businessId, customerKey, "product");
     } catch (error) {
       logger.warn(
-        {
-          productId: matchedProduct.id,
-          error: error.message
-        },
-        "Product image send failed. Falling back to text."
+        { businessId, customerKey, error: error.message },
+        "Product image history is unavailable; sending a text reply only."
       );
+    }
+    const available = productImageRequest
+      ? images
+      : images.slice(0, 1);
+    const nextImage = available.find((image) => {
+      const key = mediaImageKey(image);
+      return key && !sentKeys.has(key);
+    });
+
+    if (nextImage) {
+      try {
+        const delivered = await sendImageOnce({
+          socket,
+          remoteJid,
+          businessId,
+          customerKey,
+          assetType: "product",
+          assetId: matchedProduct.id || matchedProduct.sku || matchedProduct.product_name,
+          image: nextImage,
+          caption: reply
+        });
+        if (delivered.sent) return { messageResult: delivered.result, productImageSent: true, promotionImageSent: false };
+      } catch (error) {
+        logger.warn(
+          { businessId, customerKey, productId: matchedProduct.id, error: error.message },
+          "Product image send failed. Falling back to text."
+        );
+      }
     }
   }
 
-  return sendText(socket, remoteJid, reply);
+  const textResult = await sendText(socket, remoteJid, reply);
+  let promotionImageSent = false;
+
+  if (!matchedProduct && !suppressPromotionImage && (promotionImageRequest || promotions.length > 0)) {
+    let sentKeys = new Set();
+    try {
+      sentKeys = await getSentMediaImageKeys(businessId, customerKey, "promotion");
+    } catch (error) {
+      logger.warn(
+        { businessId, customerKey, error: error.message },
+        "Promotion image history is unavailable; sending text only."
+      );
+      return { messageResult: textResult, productImageSent: false, promotionImageSent: false };
+    }
+    let chosen = null;
+    for (const promotion of promotionCandidates) {
+      const images = [...(promotion?.images || [])].sort(
+        (a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0)
+      );
+      const image = images.find((candidate) => {
+        const key = mediaImageKey(candidate);
+        return key && !sentKeys.has(key);
+      });
+      if (image) {
+        chosen = { promotion, image };
+        break;
+      }
+    }
+
+    if (chosen) {
+      const captionParts = [chosen.promotion.title];
+      if (chosen.promotion.price !== null && chosen.promotion.price !== undefined && chosen.promotion.price !== "") {
+        captionParts.push(`${chosen.promotion.currency || "AED"} ${chosen.promotion.price}`);
+      }
+      try {
+        const delivered = await sendImageOnce({
+          socket,
+          remoteJid,
+          businessId,
+          customerKey,
+          assetType: "promotion",
+          assetId: chosen.promotion.id,
+          image: chosen.image,
+          caption: captionParts.filter(Boolean).join(" • ")
+        });
+        promotionImageSent = delivered.sent;
+      } catch (error) {
+        logger.warn(
+          { businessId, customerKey, promotionId: chosen.promotion.id, error: error.message },
+          "Promotion image send failed; the text introduction was still delivered."
+        );
+      }
+    }
+  }
+
+  return { messageResult: textResult, productImageSent: false, promotionImageSent };
 }
 
 /* =========================================================
@@ -733,11 +905,42 @@ async function handleIncomingMessage({
     return;
   }
 
+  // Unwrap common WhatsApp wrappers before extracting text. Baileys may
+  // place content inside ephemeral/view-once wrappers.
+  let content = message?.message || {};
+  for (let i = 0; i < 4; i += 1) {
+    const wrapped =
+      content?.ephemeralMessage?.message ||
+      content?.viewOnceMessage?.message ||
+      content?.viewOnceMessageV2?.message ||
+      content?.viewOnceMessageV2Extension?.message ||
+      content?.documentWithCaptionMessage?.message;
+
+    if (!wrapped) break;
+    content = wrapped;
+  }
+
+  const normalizedMessage = content === message?.message
+    ? message
+    : { ...message, message: content };
+
+  const text = extractText(normalizedMessage);
+
+  // Do not mark an unrecognized/non-text message as processed before text
+  // extraction. This allows a later decrypted/retried event to be handled.
+  if (!text) {
+    logger.debug(
+      {
+        businessId: session?.businessId || null,
+        messageId,
+        messageTypes: Object.keys(content || {})
+      },
+      "Incoming WhatsApp message has no supported text content; skipped without deduplication."
+    );
+    return;
+  }
+
   rememberMessage(messageId);
-
-  const text = extractText(message);
-
-  if (!text) return;
 
   const whatsappSocket = socket || session?.socket;
 
@@ -774,6 +977,34 @@ async function handleIncomingMessage({
     },
     "Processing incoming customer message."
   );
+
+  const conversationHistory = await loadConversationHistory({
+    businessId,
+    customerKey,
+    excludeMessageId: messageId,
+    limit: 12
+  }).catch((error) => {
+    logger.warn(
+      { businessId, customerKey, error: error.message },
+      "Conversation history lookup failed."
+    );
+    return [];
+  });
+
+  try {
+    await saveConversationMessage({
+      businessId,
+      customerKey,
+      role: "user",
+      content: text,
+      messageId
+    });
+  } catch (error) {
+    logger.warn(
+      { businessId, customerKey, error: error.message },
+      "Direct-reply conversation history save failed."
+    );
+  }
 
   /* =======================================================
      SAVE INCOMING MESSAGE
@@ -851,6 +1082,53 @@ async function handleIncomingMessage({
     };
   }
 
+  try {
+    const control = await getConversationControl(businessId, customerKey);
+    if (control?.paused) {
+      logger.info(
+        { businessId, customerKey, reason: control.reason || "manual_takeover" },
+        "AI reply suppressed because this conversation is paused for human takeover."
+      );
+      return { ok: true, skipped: "human_takeover" };
+    }
+  } catch (error) {
+    logger.error(
+      { businessId, customerKey, error: error.message },
+      "Conversation control state could not be loaded; AI reply suppressed until the persistent handover state is available."
+    );
+    return { ok: false, skipped: "conversation_control_unavailable" };
+  }
+
+  if (likelyAiToAiLoop(conversationHistory, text)) {
+    const handoffText = "I’ll have a member of our team take over this conversation.";
+    try {
+      const sent = await sendText(whatsappSocket, remoteJid, handoffText);
+      await saveConversationMessage({
+        businessId,
+        customerKey,
+        role: "assistant",
+        content: handoffText,
+        messageId: sent?.key?.id || null
+      });
+      await setConversationControl(businessId, customerKey, true, "probable_ai_to_ai_loop");
+      await notifyBusinessOwner({
+        business,
+        socket: whatsappSocket,
+        session,
+        customerPhone,
+        customerName,
+        question: text,
+        reason: "Possible automated AI conversation detected; replies are paused."
+      });
+    } catch (error) {
+      logger.error(
+        { businessId, customerKey, error: error.message },
+        "Probable AI-to-AI loop handoff failed."
+      );
+    }
+    return { ok: true, skipped: "probable_ai_to_ai_loop" };
+  }
+
   /* =======================================================
      SUBSCRIPTION GATE
   ======================================================= */
@@ -863,6 +1141,27 @@ async function handleIncomingMessage({
       businessId,
       socket: whatsappSocket
     });
+  }
+
+  if (/\b(stop|unsubscribe|do not contact|don't contact|remove me)\b/i.test(text)) {
+    const reply = "Understood. We won’t send further messages.";
+    try {
+      const sent = await sendText(whatsappSocket, remoteJid, reply);
+      await saveConversationMessage({
+        businessId,
+        customerKey,
+        role: "assistant",
+        content: reply,
+        messageId: sent?.key?.id || null
+      });
+      await setConversationControl(businessId, customerKey, true, "customer_opt_out");
+    } catch (error) {
+      logger.error(
+        { businessId, customerKey, error: error.message },
+        "Customer opt-out could not be saved."
+      );
+    }
+    return { ok: true, skipped: "customer_opt_out" };
   }
 
   /* =======================================================
@@ -902,136 +1201,62 @@ async function handleIncomingMessage({
     catalog = [];
   }
 
-  const relevantProducts = findRelevantProducts(catalog, text);
-  const productContext = buildProductContext(relevantProducts);
-  const menuChoice = normalizeMenuChoice(text);
-
-  // First contact shows the two explicit choices instead of unsolicited
-  // promotion copy. The menu can also be re-opened with a greeting later.
-  if (isGreeting(text) && !menuChoice) {
-    const reply = buildWelcomeMenu(business);
-    try {
-      const sent = await sendText(whatsappSocket, remoteJid, reply);
-      try {
-        await saveMessage({
-          business_id: businessId,
-          channel: "whatsapp",
-          direction: "outbound",
-          customer_phone: customerPhone,
-          message: reply,
-          message_id: sent?.key?.id || null,
-          metadata: { menu: "welcome", options: ["promotions", "products"] }
-        });
-      } catch (error) {
-        logger.warn({ businessId, error: error.message }, "Welcome menu persistence failed.");
-      }
-      return { ok: true, reply, menu: true };
-    } catch (error) {
-      logger.error({ businessId, error: error.message }, "Welcome menu send failed.");
-      return { ok: false, reason: "welcome_menu_send_failed" };
-    }
-  }
-
-  if (menuChoice === "promotions" || menuChoice === "products") {
-    let reply;
-    let sent;
-    let imageSent = false;
-    let promotionsToMark = [];
-    let productImageProduct = null;
-
-    try {
-      if (menuChoice === "promotions") {
-        const activePromotions = await getPromotionsForCustomerIntro(
-          businessId,
-          customerKey,
-          { includeAll: true }
-        );
-        promotionsToMark = activePromotions;
-        reply = buildPromotionList(business, activePromotions);
-        sent = await sendText(whatsappSocket, remoteJid, reply);
-
-        // Only the first eligible promotion image is sent; never blast every flyer.
-        for (const promotion of activePromotions) {
-          const imageUrl = await getPrimaryPromotionImage(promotion);
-          if (!imageUrl) continue;
-          await sendImage(whatsappSocket, remoteJid, imageUrl, promotion.title || "Current promotion");
-          imageSent = true;
-          break;
-        }
-      } else {
-        reply = buildProductList(business, catalog);
-        sent = await sendText(whatsappSocket, remoteJid, reply);
-
-        // Product selection sends at most one product image, and never a promotion flyer.
-        for (const product of catalog) {
-          const imageUrl = await getPrimaryProductImage(product);
-          if (!imageUrl) continue;
-          productImageProduct = product;
-          await sendImage(whatsappSocket, remoteJid, imageUrl, product.product_name || "Product");
-          imageSent = true;
-          break;
-        }
-      }
-
-      for (const promotion of promotionsToMark) {
-        try {
-          await markPromotionIntroduced({
-            businessId,
-            promotionId: promotion.id,
-            customerKey,
-            promotionUpdatedAt: promotion.updated_at
-          });
-        } catch (error) {
-          logger.warn({ businessId, promotionId: promotion.id, error: error.message }, "Promotion view tracking failed.");
-        }
-      }
-
-      try {
-        await saveMessage({
-          business_id: businessId,
-          channel: "whatsapp",
-          direction: "outbound",
-          customer_phone: customerPhone,
-          message: reply,
-          message_id: sent?.key?.id || null,
-          metadata: {
-            menu: menuChoice,
-            promotion_count: promotionsToMark.length,
-            product_count: menuChoice === "products" ? catalog.length : 0,
-            image_sent: imageSent,
-            product_id: productImageProduct?.id || null
-          }
-        });
-      } catch (error) {
-        logger.warn({ businessId, error: error.message }, "Menu response persistence failed.");
-      }
-
-      return {
-        ok: true,
-        reply,
-        menu: menuChoice,
-        imageSent,
-        promotionCount: promotionsToMark.length,
-        productCount: menuChoice === "products" ? catalog.length : 0
-      };
-    } catch (error) {
-      logger.error({ businessId, menuChoice, error: error.message }, "Menu selection response failed.");
-      return { ok: false, reason: "menu_selection_failed" };
-    }
-  }
+  const currentProductTokens = tokenize(text);
+  const productQueryText = currentProductTokens.length === 0
+    ? [
+        conversationHistory.filter((item) => item.role === "user").slice(-1)[0]?.content || "",
+        text
+      ].filter(Boolean).join(" ")
+    : text;
+  const genericProductListRequest = isGenericProductListRequest(text);
+  const relevantProducts = findRelevantProducts(catalog, productQueryText);
+  const productContext = buildProductContext(
+    genericProductListRequest ? catalog.slice(0, 20) : relevantProducts
+  );
+  const matchedProduct = relevantProducts.length === 1 ? relevantProducts[0] : null;
+  const promotionImageRequest = isPromotionImageRequest(text, conversationHistory);
+  const productImageRequest = isImageRequest(text) && !promotionImageRequest;
+  const productInquiry = isProductInquiry(text) &&
+    !promotionImageRequest &&
+    !isPromotionQuestion(text) &&
+    !/\b(appointment|booking|schedule)\b/i.test(text);
+  const unknownProductRequest =
+    productInquiry &&
+    !genericProductListRequest &&
+    !/\b(appointment|booking|schedule|slot|time|date|today|tomorrow|next week)\b/i.test(text) &&
+    tokenize(productQueryText).length > 0 &&
+    !matchedProduct;
 
   /* =======================================================
      LOAD NEW ACTIVE PROMOTIONS
   ======================================================= */
 
   let pendingPromotions = [];
+  let allPromotions = [];
+  const hasPriorConversation = conversationHistory.some(
+    (item) => item.role === "user" || item.role === "assistant"
+  );
 
   try {
-    pendingPromotions =
+    const unintroducedPromotions =
       await getPromotionsForCustomerIntro(
         businessId,
         customerKey
       );
+    pendingPromotions =
+      !hasPriorConversation && !isPromotionQuestion(text) && !promotionImageRequest
+        ? []
+        : unintroducedPromotions;
+
+    if (promotionImageRequest || isPromotionQuestion(text)) {
+      allPromotions = await getPromotionsForCustomerIntro(
+        businessId,
+        customerKey,
+        { includeIntroduced: true }
+      );
+    } else {
+      allPromotions = pendingPromotions;
+    }
 
     logger.info(
       {
@@ -1054,7 +1279,11 @@ async function handleIncomingMessage({
     pendingPromotions = [];
   }
 
-  const promotionContext = pendingPromotions.map(
+  const promptPromotions = pendingPromotions.length
+    ? pendingPromotions
+    : (isPromotionQuestion(text) && !promotionImageRequest ? allPromotions : []);
+
+  const promotionContext = promptPromotions.map(
     (promotion) => ({
       id: promotion.id,
       title: promotion.title || null,
@@ -1082,9 +1311,17 @@ async function handleIncomingMessage({
       customerPhone,
       customerName,
       messageText: text,
+      conversationHistory,
       products: productContext,
       promotions: promotionContext,
-      introducePromotions: pendingPromotions.length > 0
+      introducePromotions: pendingPromotions.length > 0 ||
+        (isPromotionQuestion(text) && !promotionImageRequest),
+      imageRequest: promotionImageRequest
+        ? "promotion"
+        : productImageRequest
+          ? "product"
+          : "",
+      unknownProductRequest
     });
   } catch (error) {
     logger.error(
@@ -1111,7 +1348,11 @@ async function handleIncomingMessage({
     return;
   }
 
-  const reply = String(result.reply || "").trim();
+  let reply = String(result.reply || "").trim();
+
+  if (unknownProductRequest) {
+    reply = "Let me confirm those details with the business team and get back to you.";
+  }
 
   if (!reply) {
     logger.warn(
@@ -1120,39 +1361,6 @@ async function handleIncomingMessage({
     );
 
     return;
-  }
-
-  /* =======================================================
-     RESOLVE REAL PROMOTION IMAGES
-  ======================================================= */
-
-  const promotionAssets = [];
-
-  for (const promotion of pendingPromotions) {
-    const imageUrl = await getPrimaryPromotionImage(promotion);
-    if (!imageUrl) continue;
-    promotionAssets.push({
-      id: promotion.id,
-      title: promotion.title,
-      price: promotion.price,
-      currency: promotion.currency || "AED",
-      imageUrl
-    });
-    break; // One eligible promotion image per reply.
-  }
-
-  /* =======================================================
-     PRODUCT IMAGE
-  ======================================================= */
-
-  let productImageUrl = null;
-  let matchedProduct = null;
-
-  if (relevantProducts.length === 1) {
-    matchedProduct = relevantProducts[0];
-
-    productImageUrl =
-      await getPrimaryProductImage(matchedProduct);
   }
 
   /* =======================================================
@@ -1166,8 +1374,14 @@ async function handleIncomingMessage({
       socket: whatsappSocket,
       remoteJid,
       reply,
-      promotionAssets,
-      productImageUrl,
+      businessId,
+      customerKey,
+      pendingPromotions,
+      allPromotions,
+      promotionImageRequest,
+      suppressPromotionImage: unknownProductRequest ||
+        (productInquiry && !genericProductListRequest),
+      productImageRequest,
       matchedProduct
     });
   } catch (error) {
@@ -1183,11 +1397,54 @@ async function handleIncomingMessage({
     return;
   }
 
+  try {
+    await saveConversationMessage({
+      businessId,
+      customerKey,
+      role: "assistant",
+      content: reply,
+      messageId: sent?.messageResult?.key?.id || sent?.key?.id || null
+    });
+  } catch (error) {
+    logger.warn(
+      { businessId, customerKey, error: error.message },
+      "Direct-reply assistant message history save failed."
+    );
+  }
+
+  if (unknownProductRequest) {
+    try {
+      await setConversationControl(businessId, customerKey, true, "unknown_product_handover");
+    } catch (error) {
+      logger.error(
+        { businessId, customerKey, error: error.message },
+        "Unknown product handoff pause could not be saved."
+      );
+    }
+
+    try {
+      await notifyBusinessOwner({
+        business,
+        socket: whatsappSocket,
+        session,
+        customerPhone,
+        customerName,
+        question: text,
+        reason: "A requested product or its details could not be confirmed."
+      });
+    } catch (error) {
+      logger.error(
+        { businessId, customerKey, error: error.message },
+        "Unknown product handoff could not be persisted or sent to the business owner."
+      );
+    }
+  }
+
   /* =======================================================
      MARK PROMOTIONS AS INTRODUCED
   ======================================================= */
 
-  if (pendingPromotions.length > 0) {
+  if (pendingPromotions.length > 0 && !unknownProductRequest) {
     for (const promotion of pendingPromotions) {
       try {
         await markPromotionIntroduced({
@@ -1221,7 +1478,7 @@ async function handleIncomingMessage({
       direction: "outbound",
       customer_phone: customerPhone,
       message: reply,
-      message_id: sent?.key?.id || null,
+      message_id: sent?.messageResult?.key?.id || sent?.key?.id || null,
       metadata: {
         customer_name: customerName || null,
         promotions_introduced: pendingPromotions.map(
@@ -1230,10 +1487,10 @@ async function handleIncomingMessage({
             title: promotion.title
           })
         ),
-        promotion_images_sent: promotionAssets.length,
+        promotion_images_sent: sent?.promotionImageSent ? 1 : 0,
         product_id: matchedProduct?.id || null,
         product_name: matchedProduct?.product_name || null,
-        product_image_sent: Boolean(productImageUrl)
+        product_image_sent: Boolean(sent?.productImageSent)
       }
     });
   } catch (error) {
@@ -1249,11 +1506,11 @@ async function handleIncomingMessage({
       businessId,
       customerPhone,
       customerName,
-      messageId: sent?.key?.id || null,
+      messageId: sent?.messageResult?.key?.id || sent?.key?.id || null,
       promotionsIntroduced: pendingPromotions.length,
-      promotionImagesSent: promotionAssets.length,
+      promotionImageSent: Boolean(sent?.promotionImageSent),
       productId: matchedProduct?.id || null,
-      productImageSent: Boolean(productImageUrl)
+      productImageSent: Boolean(sent?.productImageSent)
     },
     "WhatsApp AI reply completed."
   );
@@ -1271,7 +1528,7 @@ async function handleIncomingMessage({
       ? {
           id: matchedProduct.id,
           name: matchedProduct.product_name,
-          imageSent: Boolean(productImageUrl)
+          imageSent: Boolean(sent?.productImageSent)
         }
       : null
   };
@@ -1286,9 +1543,5 @@ module.exports = {
   extractText,
   phoneFromJid,
   extractCustomerName,
-  normalizeMenuChoice,
-  isGreeting,
-  buildWelcomeMenu,
-  buildPromotionList,
-  buildProductList
+  wasAutomatedMessage
 };
