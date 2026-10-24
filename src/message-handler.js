@@ -905,42 +905,11 @@ async function handleIncomingMessage({
     return;
   }
 
-  // Unwrap common WhatsApp wrappers before extracting text. Baileys may
-  // place content inside ephemeral/view-once wrappers.
-  let content = message?.message || {};
-  for (let i = 0; i < 4; i += 1) {
-    const wrapped =
-      content?.ephemeralMessage?.message ||
-      content?.viewOnceMessage?.message ||
-      content?.viewOnceMessageV2?.message ||
-      content?.viewOnceMessageV2Extension?.message ||
-      content?.documentWithCaptionMessage?.message;
-
-    if (!wrapped) break;
-    content = wrapped;
-  }
-
-  const normalizedMessage = content === message?.message
-    ? message
-    : { ...message, message: content };
-
-  const text = extractText(normalizedMessage);
-
-  // Do not mark an unrecognized/non-text message as processed before text
-  // extraction. This allows a later decrypted/retried event to be handled.
-  if (!text) {
-    logger.debug(
-      {
-        businessId: session?.businessId || null,
-        messageId,
-        messageTypes: Object.keys(content || {})
-      },
-      "Incoming WhatsApp message has no supported text content; skipped without deduplication."
-    );
-    return;
-  }
-
   rememberMessage(messageId);
+
+  const text = extractText(message);
+
+  if (!text) return;
 
   const whatsappSocket = socket || session?.socket;
 
