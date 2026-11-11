@@ -32,6 +32,11 @@ const {
 const processed = new Map();
 const automatedMessageIds = new Set();
 
+// Per-customer image gallery state. This is deliberately in-memory only: it
+// never creates or modifies a WhatsApp session and expires automatically.
+const imageGalleries = new Map();
+const GALLERY_TTL_MS = 30 * 60 * 1000;
+
 const ttlMs =
   Number(process.env.MESSAGE_DEDUP_TTL_SECONDS || 120) *
   1000;
@@ -127,6 +132,13 @@ function extractText(message) {
     m.buttonsResponseMessage?.selectedDisplayText ||
     m.listResponseMessage?.title ||
     m.templateButtonReplyMessage?.selectedDisplayText ||
+    m.interactiveResponseMessage?.body?.text ||
+    (() => {
+      try {
+        const params = JSON.parse(m.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson || "{}");
+        return params.display_text || params.id || "";
+      } catch { return ""; }
+    })() ||
     ""
   ).trim();
 }
@@ -787,37 +799,31 @@ async function sendReply({
     try {
       sentKeys = await getSentMediaImageKeys(businessId, customerKey, "product");
     } catch (error) {
-      logger.warn(
-        { businessId, customerKey, error: error.message },
-        "Product image history is unavailable; sending a text reply only."
-      );
+      logger.warn({ businessId, customerKey, error: error.message }, "Product image history unavailable; sending text only.");
     }
-    const available = productImageRequest
-      ? images
-      : images.slice(0, 1);
-    const nextImage = available.find((image) => {
+    const available = (productImageRequest ? images : images.slice(0, 1)).filter((image) => {
       const key = mediaImageKey(image);
       return key && !sentKeys.has(key);
     });
-
-    if (nextImage) {
+    if (available.length) {
       try {
-        const delivered = await sendImageOnce({
-          socket,
-          remoteJid,
-          businessId,
-          customerKey,
-          assetType: "product",
-          assetId: matchedProduct.id || matchedProduct.sku || matchedProduct.product_name,
-          image: nextImage,
-          caption: reply
+        const assetId = matchedProduct.id || matchedProduct.sku || matchedProduct.product_name;
+        const gallery = productImageRequest ? createGallery({
+          businessId, customerKey, assetType: "product", assetId,
+          items: available.map((image) => ({ image, caption: `${matchedProduct.product_name || "Product"}${matchedProduct.price !== null && matchedProduct.price !== undefined && matchedProduct.price !== "" ? ` • ${matchedProduct.currency || "AED"} ${matchedProduct.price}` : ""}` }))
+        }) : null;
+        const first = await sendImageOnce({
+          socket, remoteJid, businessId, customerKey,
+          assetType: "product", assetId, image: available[0],
+          caption: `${reply}${gallery ? `\n\nImage 1 of ${available.length}. Reply NEXT or PREVIOUS to browse.` : ""}`
         });
-        if (delivered.sent) return { messageResult: delivered.result, productImageSent: true, promotionImageSent: false };
+        if (first.sent) {
+          if (gallery) { gallery.index = 0; gallery.updatedAt = Date.now(); }
+          return { messageResult: first.result, productImageSent: true, promotionImageSent: false, galleryCount: gallery?.items.length || 1 };
+        }
+        if (gallery) imageGalleries.delete(galleryKey(businessId, customerKey));
       } catch (error) {
-        logger.warn(
-          { businessId, customerKey, productId: matchedProduct.id, error: error.message },
-          "Product image send failed. Falling back to text."
-        );
+        logger.warn({ businessId, customerKey, productId: matchedProduct.id, error: error.message }, "Product image gallery send failed; falling back to text.");
       }
     }
   }
@@ -836,48 +842,116 @@ async function sendReply({
       );
       return { messageResult: textResult, productImageSent: false, promotionImageSent: false };
     }
-    let chosen = null;
+    const candidates = [];
     for (const promotion of promotionCandidates) {
       const images = [...(promotion?.images || [])].sort(
         (a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0)
       );
-      const image = images.find((candidate) => {
+      const available = images.filter((candidate) => {
         const key = mediaImageKey(candidate);
         return key && !sentKeys.has(key);
       });
-      if (image) {
-        chosen = { promotion, image };
-        break;
+      if (available.length) {
+        candidates.push({ promotion, images: available });
+        if (!promotionImageRequest) break;
       }
     }
 
-    if (chosen) {
-      const captionParts = [chosen.promotion.title];
-      if (chosen.promotion.price !== null && chosen.promotion.price !== undefined && chosen.promotion.price !== "") {
-        captionParts.push(`${chosen.promotion.currency || "AED"} ${chosen.promotion.price}`);
+    if (candidates.length) {
+      const chosen = candidates[0];
+      const promotion = chosen.promotion;
+      const captionParts = [promotion.title];
+      if (promotion.price !== null && promotion.price !== undefined && promotion.price !== "") {
+        captionParts.push(`${promotion.currency || "AED"} ${promotion.price}`);
       }
+      const gallery = promotionImageRequest ? createGallery({
+        businessId, customerKey, assetType: "promotion", assetId: promotion.id,
+        items: chosen.images.map((image) => ({ image, caption: captionParts.filter(Boolean).join(" • ") }))
+      }) : null;
       try {
         const delivered = await sendImageOnce({
-          socket,
-          remoteJid,
-          businessId,
-          customerKey,
-          assetType: "promotion",
-          assetId: chosen.promotion.id,
-          image: chosen.image,
-          caption: captionParts.filter(Boolean).join(" • ")
+          socket, remoteJid, businessId, customerKey,
+          assetType: "promotion", assetId: promotion.id,
+          image: chosen.images[0],
+          caption: `${captionParts.filter(Boolean).join(" • ")}${gallery ? `\nImage 1 of ${chosen.images.length}. Reply NEXT or PREVIOUS to browse.` : ""}`
         });
         promotionImageSent = delivered.sent;
+        if (gallery && delivered.sent) { gallery.index = 0; gallery.updatedAt = Date.now(); }
+        else if (gallery) imageGalleries.delete(galleryKey(businessId, customerKey));
       } catch (error) {
-        logger.warn(
-          { businessId, customerKey, promotionId: chosen.promotion.id, error: error.message },
-          "Promotion image send failed; the text introduction was still delivered."
-        );
+        if (gallery) imageGalleries.delete(galleryKey(businessId, customerKey));
+        logger.warn({ businessId, customerKey, promotionId: promotion.id, error: error.message }, "Promotion image gallery send failed; the text introduction was still delivered.");
       }
     }
   }
 
   return { messageResult: textResult, productImageSent: false, promotionImageSent };
+}
+
+/* =========================================================
+   CUSTOMER IMAGE GALLERY NAVIGATION
+========================================================= */
+
+function galleryKey(businessId, customerKey) {
+  return `${businessId}:${customerKey}`;
+}
+
+async function sendGalleryFrame({ socket, remoteJid, gallery, index }) {
+  const item = gallery.items[index];
+  if (!item) return false;
+  const imageUrl = await getProductImageUrl(
+    item.image,
+    3600,
+    gallery.assetType === "promotion"
+      ? process.env.SUPABASE_PROMOTION_IMAGE_BUCKET || "business-promotion-images"
+      : process.env.SUPABASE_PRODUCT_IMAGE_BUCKET || "business-product-images"
+  );
+  if (!imageUrl) return false;
+  await sendImage(socket, remoteJid, imageUrl,
+    `${item.caption}\nImage ${index + 1} of ${gallery.items.length}\nReply NEXT or PREVIOUS to browse.`);
+  gallery.index = index;
+  gallery.updatedAt = Date.now();
+  return true;
+}
+
+async function handleGalleryNavigation({ text, socket, remoteJid, businessId, customerKey }) {
+  const command = normalizeText(text);
+  if (!/^(next|next image|previous|previous image|prev|back|stop gallery|close gallery)$/.test(command)) return false;
+  const key = galleryKey(businessId, customerKey);
+  const gallery = imageGalleries.get(key);
+  if (!gallery || Date.now() - gallery.updatedAt > GALLERY_TTL_MS) {
+    imageGalleries.delete(key);
+    await sendText(socket, remoteJid, "There isn't an active image gallery. Ask me to show the product or promotion images again.");
+    return true;
+  }
+  if (command === "stop gallery" || command === "close gallery") {
+    imageGalleries.delete(key);
+    await sendText(socket, remoteJid, "Image gallery closed.");
+    return true;
+  }
+  const delta = /^(previous|previous image|prev|back)$/.test(command) ? -1 : 1;
+  const nextIndex = gallery.index + delta;
+  if (nextIndex < 0 || nextIndex >= gallery.items.length) {
+    await sendText(socket, remoteJid, nextIndex < 0 ? "You're already at the first image. Reply NEXT to continue." : "You've reached the last image. Reply PREVIOUS to go back.");
+    gallery.updatedAt = Date.now();
+    return true;
+  }
+  const sent = await sendGalleryFrame({ socket, remoteJid, gallery, index: nextIndex });
+  if (!sent) await sendText(socket, remoteJid, "I couldn't load that image just now. Please try again.");
+  return true;
+}
+
+function createGallery({ businessId, customerKey, assetType, assetId, items }) {
+  const validItems = (Array.isArray(items) ? items : []).filter((item) => item?.image);
+  if (validItems.length < 2) return null;
+  const gallery = { businessId, customerKey, assetType, assetId, items: validItems, index: 0, updatedAt: Date.now() };
+  imageGalleries.set(galleryKey(businessId, customerKey), gallery);
+  // Bound memory usage and prune expired galleries.
+  for (const [key, value] of imageGalleries) {
+    if (Date.now() - value.updatedAt > GALLERY_TTL_MS) imageGalleries.delete(key);
+  }
+  while (imageGalleries.size > 2000) imageGalleries.delete(imageGalleries.keys().next().value);
+  return gallery;
 }
 
 /* =========================================================
@@ -934,6 +1008,16 @@ async function handleIncomingMessage({
   const customerPhone = phoneFromJid(remoteJid);
   const customerName = extractCustomerName(message);
   const customerKey = customerPhone || remoteJid;
+
+  try {
+    if (await handleGalleryNavigation({ text, socket: whatsappSocket, remoteJid, businessId, customerKey })) {
+      return { ok: true, galleryNavigation: true };
+    }
+  } catch (error) {
+    logger.warn({ businessId, customerKey, error: error.message }, "Image gallery navigation failed.");
+    await sendText(whatsappSocket, remoteJid, "I couldn't move through the images. Please ask me to show them again.");
+    return { ok: false, galleryNavigation: true };
+  }
 
   logger.info(
     {
