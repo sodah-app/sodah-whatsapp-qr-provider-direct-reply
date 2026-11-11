@@ -13,7 +13,8 @@ const {
   DisconnectReason,
 } = require("@whiskeysockets/baileys");
 
-const { handleIncomingMessage } = require("./message-handler");
+const { handleIncomingMessage, phoneFromJid, wasAutomatedMessage } = require("./message-handler");
+const { setConversationControl } = require("./supabase");
 
 /*
 |--------------------------------------------------------------------------
@@ -308,26 +309,28 @@ function publicSession(session) {
 */
 
 function extractMessageText(message) {
-  let content = message?.message;
-  // Baileys may wrap user messages in ephemeral or view-once containers.
-  for (let i = 0; i < 5 && content; i += 1) {
-    const wrapped = content.ephemeralMessage?.message ||
-      content.viewOnceMessage?.message ||
-      content.viewOnceMessageV2?.message ||
-      content.documentWithCaptionMessage?.message;
-    if (!wrapped) break;
-    content = wrapped;
+  if (!message?.message) {
+    return "";
   }
-  if (!content) return "";
-  const selected = content.buttonsResponseMessage?.selectedDisplayText ||
-    content.buttonsResponseMessage?.selectedButtonId ||
-    content.listResponseMessage?.title ||
-    content.listResponseMessage?.singleSelectReply?.selectedRowId ||
-    content.templateButtonReplyMessage?.selectedDisplayText ||
-    content.templateButtonReplyMessage?.selectedId;
-  return String(content.conversation || content.extendedTextMessage?.text ||
-    content.imageMessage?.caption || content.videoMessage?.caption ||
-    content.documentMessage?.caption || selected || "").trim();
+
+  return (
+    message.message.conversation ||
+    message.message.extendedTextMessage?.text ||
+    message.message.imageMessage?.caption ||
+    message.message.videoMessage?.caption ||
+    message.message.documentMessage?.caption ||
+    message.message.buttonsResponseMessage?.selectedDisplayText ||
+    message.message.listResponseMessage?.title ||
+    message.message.templateButtonReplyMessage?.selectedDisplayText ||
+    message.message.interactiveResponseMessage?.body?.text ||
+    (() => {
+      try {
+        const params = JSON.parse(message.message.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson || "{}");
+        return params.display_text || params.id || "";
+      } catch { return ""; }
+    })() ||
+    ""
+  );
 }
 
 /*
@@ -912,6 +915,32 @@ async function createSession(
             continue;
           }
 
+          const from = message.key?.remoteJid || "";
+          const text = extractMessageText(message).trim();
+          const messageId = message.key?.id || "";
+
+          if (message.key?.fromMe) {
+            if (wasAutomatedMessage(messageId)) {
+              continue;
+            }
+
+            const customerKey = phoneFromJid(from) || from;
+            if (/^(AI ON|AI RESUME|HUMAN OFF)$/i.test(text)) {
+              await setConversationControl(businessId, customerKey, false);
+              logger.info(
+                { businessId, customerKey },
+                "AI resumed by the business owner."
+              );
+            } else if (text && customerKey) {
+              await setConversationControl(businessId, customerKey, true, "owner_message");
+              logger.info(
+                { businessId, customerKey },
+                "AI paused because the business owner replied directly."
+              );
+            }
+            continue;
+          }
+
           /*
            * Ignore messages sent
            * by the business itself.
@@ -922,10 +951,6 @@ async function createSession(
           ) {
             continue;
           }
-
-          const from =
-            message.key
-              ?.remoteJid || "";
 
           /*
            * Ignore WhatsApp status.
@@ -953,11 +978,6 @@ async function createSession(
           /*
            * Extract message text.
            */
-          const text =
-            extractMessageText(
-              message
-            );
-
           if (
             !text.trim()
           ) {
@@ -967,9 +987,6 @@ async function createSession(
           /*
            * Message ID.
            */
-          const messageId =
-            message.key?.id;
-
           if (!messageId) {
             continue;
           }
