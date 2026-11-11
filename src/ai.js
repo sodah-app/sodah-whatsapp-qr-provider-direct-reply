@@ -176,7 +176,9 @@ function buildSystemPrompt({
   customerPhone,
   products,
   promotions,
-  introducePromotions
+  introducePromotions,
+  imageRequest = "",
+  unknownProductRequest = false
 }) {
   const businessInfo = businessContext(business);
   const catalog = safeProducts(products);
@@ -224,6 +226,8 @@ Do not call it "the best", "cheapest", "amazing", "limited", "special", etc. unl
 Keep the promotion introduction concise and conversational.
 
 The server will send the real uploaded flyer separately when one exists.
+The server sends no more than one promotion image in a reply. List every supplied promotion in concise text, but do not claim or imply that every promotion has its own image attached.
+An image already shown to this customer must not be repeated. Another image may be sent only when the customer explicitly asks to see promotion images.
 Do not claim that an image was sent unless the messaging layer confirms it.
 `
     : `
@@ -267,6 +271,8 @@ PRODUCT RULES:
 - Never invent a product, price, availability, SKU or service.
 - If has_image is YES, the server may attach the real uploaded product image.
 - Never generate or describe a fictional product image.
+- Never attach an unrelated promotion image to answer a product question.
+- If the requested product is not confirmed by the supplied records, do not say it is "not in the catalog" or expose catalog limits. Do not guess or attach another product's image. Say naturally that you will confirm the details with the business team.
 
 ==================================================
 ACTIVE PROMOTIONS / PACKAGES
@@ -295,6 +301,12 @@ CORE RESPONSE RULES
 14. If information is genuinely missing, say so naturally instead of inventing it.
 15. Do not dump the entire business profile into the response.
 16. Avoid excessive emojis.
+17. You represent only ${businessName}. Speak like a member of that business's team. Never say you manage multiple businesses, mention another business, or introduce Sodah.io unless Sodah.io is the configured business name.
+18. Use the conversation history to continue the current topic. Do not restart with a welcome or ask "How can I help?" when the customer has already stated what they need.
+19. When the customer is asking to book or discuss an appointment, stay on that booking request. Ask only for the next missing detail; do not switch to a general business introduction.
+20. If a product inquiry is not matched to a supplied product record, respond as a helpful business representative and do not send any product or promotion image unless the customer explicitly asked for an image.
+${unknownProductRequest ? "21. The requested product could not be confirmed from the supplied records. Do not claim it is unavailable or absent from a catalog. Say you will confirm its details with the business team, and do not invent an answer." : ""}
+${imageRequest ? `22. The customer explicitly requested an image. The messaging layer will attach at most one real, not-yet-sent image. Keep the reply concise and do not claim an image was sent unless the message result confirms it. Request type: ${imageRequest}.` : ""}
 `.trim();
 }
 
@@ -404,7 +416,7 @@ function buildPromotionFallback(promotions, customerName) {
     ].filter(Boolean).join(" — ");
   });
 
-  return `${greeting}\n\nWe currently have:\n${lines.join("\n")}\n\nHow can I help you today?`;
+  return `${greeting}\n\nWe currently have:\n${lines.join("\n")}\n\nWhich offer would you like to know more about?`;
 }
 
 async function generateReply({
@@ -412,9 +424,12 @@ async function generateReply({
   customerPhone,
   customerName,
   messageText,
+  conversationHistory = [],
   products = [],
   promotions = [],
-  introducePromotions = false
+  introducePromotions = false,
+  imageRequest = "",
+  unknownProductRequest = false
 }) {
   if (!business) {
     return { ok: false, error: "Business context is missing." };
@@ -445,7 +460,9 @@ async function generateReply({
     customerPhone,
     products: safeCatalog,
     promotions: safePromotionList,
-    introducePromotions: safePromotionList.length > 0
+    introducePromotions: safePromotionList.length > 0,
+    imageRequest,
+    unknownProductRequest
   });
 
   try {
@@ -465,8 +482,18 @@ async function generateReply({
       "Generating customer-facing WhatsApp AI reply."
     );
 
+    const historyMessages = (Array.isArray(conversationHistory) ? conversationHistory : [])
+      .filter((message) => message && ["user", "assistant"].includes(message.role))
+      .slice(-12)
+      .map((message) => ({
+        role: message.role,
+        content: cleanText(message.content).slice(0, 4000)
+      }))
+      .filter((message) => message.content);
+
     let reply = await callOpenAI([
       { role: "system", content: systemPrompt },
+      ...historyMessages,
       { role: "user", content: text }
     ]);
 
