@@ -37,6 +37,17 @@ const CUSTOMERS_TABLE =
 const MESSAGES_TABLE =
   process.env.SUPABASE_MESSAGES_TABLE || "messages";
 
+const DIRECT_HISTORY_TABLE =
+  process.env.SUPABASE_DIRECT_HISTORY_TABLE || "whatsapp_ai_conversation_messages";
+
+const MEDIA_DELIVERIES_TABLE =
+  process.env.SUPABASE_MEDIA_DELIVERIES_TABLE || "whatsapp_media_deliveries";
+
+const CONVERSATION_CONTROLS_TABLE =
+  process.env.SUPABASE_CONVERSATION_CONTROLS_TABLE || "whatsapp_ai_controls";
+
+const localConversationControls = new Map();
+
 const PRODUCT_IMAGE_BUCKET =
   process.env.SUPABASE_PRODUCT_IMAGE_BUCKET || "business-product-images";
 
@@ -642,9 +653,12 @@ async function getProductImageUrl(
    PROMOTIONS
 ========================================================= */
 
-async function getPromotionsForCustomerIntro(businessId, customerKey, options = {}) {
-  const includeAll = options?.includeAll === true;
-  if (!businessId || (!customerKey && !includeAll)) return [];
+async function getPromotionsForCustomerIntro(
+  businessId,
+  customerKey,
+  { includeIntroduced = false } = {}
+) {
+  if (!businessId || !customerKey) return [];
 
   const now = new Date().toISOString();
 
@@ -743,9 +757,7 @@ async function getPromotionsForCustomerIntro(businessId, customerKey, options = 
     )
   }));
 
-  // Explicit "View Current Promotions" requests must show every currently
-  // active promotion, regardless of whether it was introduced previously.
-  if (includeAll) return promotionsWithImages;
+  if (includeIntroduced) return promotionsWithImages;
 
   let introductions = [];
 
@@ -910,6 +922,208 @@ async function upsertCustomer({
   );
 }
 
+async function loadConversationHistory({
+  businessId,
+  customerKey,
+  excludeMessageId,
+  limit = 12
+}) {
+  if (!businessId || !customerKey) return [];
+
+  try {
+    const query = [
+      `select=${encodeURIComponent("role,content,message_id,created_at")}`,
+      encodeEq("business_id", businessId),
+      encodeEq("customer_key", customerKey),
+      excludeMessageId
+        ? `message_id=neq.${encodeURIComponent(excludeMessageId)}`
+        : "",
+      "order=created_at.desc",
+      `limit=${Math.max(1, Math.min(30, Number(limit) || 12))}`
+    ].filter(Boolean).join("&");
+
+    const rows = await supabaseRequest(DIRECT_HISTORY_TABLE, query);
+    return (Array.isArray(rows) ? rows : [])
+      .reverse()
+      .map((row) => ({
+        role: row.role,
+        content: row.content,
+        message_id: row.message_id,
+        at: row.created_at
+      }));
+  } catch (error) {
+    logger.warn(
+      { businessId, customerKey, error: error.message },
+      "Direct-reply conversation history could not be loaded."
+    );
+    return [];
+  }
+}
+
+async function saveConversationMessage({
+  businessId,
+  customerKey,
+  role,
+  content,
+  messageId = null
+}) {
+  if (!businessId || !customerKey || !["user", "assistant"].includes(role) || !content) {
+    return null;
+  }
+
+  return supabaseRequest(DIRECT_HISTORY_TABLE, "on_conflict=business_id,customer_key,message_id", {
+    method: "POST",
+    prefer: "resolution=ignore-duplicates,return=minimal",
+    body: {
+      business_id: String(businessId),
+      customer_key: String(customerKey),
+      role,
+      content: String(content),
+      message_id: messageId || null
+    }
+  });
+}
+
+async function getSentMediaImageKeys(businessId, customerKey, assetType) {
+  if (!businessId || !customerKey || !assetType) return new Set();
+
+  const query = [
+    `select=${encodeURIComponent("image_key")}`,
+    encodeEq("business_id", businessId),
+    encodeEq("customer_key", customerKey),
+    encodeEq("asset_type", assetType),
+    encodeIn("status", ["sent", "sending"]),
+    "limit=1000"
+  ].join("&");
+
+  const rows = await supabaseRequest(MEDIA_DELIVERIES_TABLE, query);
+  return new Set((Array.isArray(rows) ? rows : []).map((row) => String(row.image_key || "")));
+}
+
+async function claimMediaImage({
+  businessId,
+  customerKey,
+  assetType,
+  assetId,
+  imageKey
+}) {
+  if (!businessId || !customerKey || !assetType || !assetId || !imageKey) return false;
+
+  const staleBefore = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+  try {
+    await supabaseRequest(
+      MEDIA_DELIVERIES_TABLE,
+      [
+        encodeEq("business_id", businessId),
+        encodeEq("customer_key", customerKey),
+        encodeEq("asset_type", assetType),
+        encodeEq("asset_id", assetId),
+        encodeEq("image_key", imageKey),
+        encodeEq("status", "sending"),
+        `created_at=lt.${encodeURIComponent(staleBefore)}`
+      ].join("&"),
+      { method: "DELETE", prefer: "return=minimal" }
+    );
+  } catch (error) {
+    logger.warn(
+      { businessId, customerKey, assetType, assetId, error: error.message },
+      "Stale image-delivery claim cleanup failed."
+    );
+  }
+
+  const rows = await supabaseRequest(
+    MEDIA_DELIVERIES_TABLE,
+    "on_conflict=business_id,customer_key,asset_type,asset_id,image_key",
+    {
+      method: "POST",
+      prefer: "resolution=ignore-duplicates,return=representation",
+      body: {
+        business_id: String(businessId),
+        customer_key: String(customerKey),
+        asset_type: String(assetType),
+        asset_id: String(assetId),
+        image_key: String(imageKey),
+        status: "sending"
+      }
+    }
+  );
+
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+async function finishMediaImage({
+  businessId,
+  customerKey,
+  assetType,
+  assetId,
+  imageKey,
+  sent
+}) {
+  const filters = [
+    encodeEq("business_id", businessId),
+    encodeEq("customer_key", customerKey),
+    encodeEq("asset_type", assetType),
+    encodeEq("asset_id", assetId),
+    encodeEq("image_key", imageKey),
+    encodeEq("status", "sending")
+  ].join("&");
+
+  if (sent) {
+    return supabaseRequest(MEDIA_DELIVERIES_TABLE, filters, {
+      method: "PATCH",
+      prefer: "return=minimal",
+      body: { status: "sent", sent_at: new Date().toISOString() }
+    });
+  }
+
+  return supabaseRequest(MEDIA_DELIVERIES_TABLE, filters, {
+    method: "DELETE",
+    prefer: "return=minimal"
+  });
+}
+
+async function getConversationControl(businessId, customerKey) {
+  if (!businessId || !customerKey) return null;
+  const key = `${String(businessId)}:${String(customerKey)}`;
+  if (localConversationControls.has(key)) return localConversationControls.get(key);
+  const query = [
+    `select=${encodeURIComponent("paused,reason,updated_at")}`,
+    encodeEq("business_id", businessId),
+    encodeEq("customer_key", customerKey),
+    "limit=1"
+  ].join("&");
+  const rows = await supabaseRequest(CONVERSATION_CONTROLS_TABLE, query);
+  const state = Array.isArray(rows) ? rows[0] || null : null;
+  if (state?.paused) localConversationControls.set(key, state);
+  else localConversationControls.delete(key);
+  return state;
+}
+
+async function setConversationControl(businessId, customerKey, paused, reason = null) {
+  if (!businessId || !customerKey) return null;
+  const key = `${String(businessId)}:${String(customerKey)}`;
+  const state = {
+    paused: Boolean(paused),
+    reason: paused ? (reason || "owner_takeover") : null,
+    updated_at: new Date().toISOString()
+  };
+  if (state.paused) localConversationControls.set(key, state);
+  else localConversationControls.delete(key);
+  return supabaseRequest(
+    CONVERSATION_CONTROLS_TABLE,
+    "on_conflict=business_id,customer_key",
+    {
+      method: "POST",
+      prefer: "resolution=merge-duplicates,return=representation",
+      body: {
+        business_id: String(businessId),
+        customer_key: String(customerKey),
+        ...state
+      }
+    }
+  );
+}
+
 /* =========================================================
    EXPORTS
 ========================================================= */
@@ -930,6 +1144,14 @@ module.exports = {
 
   getPromotionsForCustomerIntro,
   markPromotionIntroduced,
+
+  loadConversationHistory,
+  saveConversationMessage,
+  getSentMediaImageKeys,
+  claimMediaImage,
+  finishMediaImage,
+  getConversationControl,
+  setConversationControl,
 
   saveMessage,
   upsertCustomer,
